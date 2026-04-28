@@ -190,6 +190,8 @@ That lets downstream consumers query the published objects without any preproces
 
 For the practical details, see [docs/installation.md](docs/installation.md#access-modes).
 
+For notebook, pandas, and polars workflows, see [docs/python-dataframes.md](docs/python-dataframes.md).
+
 If you want more control, the same flow is also available as separate commands:
 
 - `exasol-json-tables ingest`
@@ -204,13 +206,16 @@ For automation and autonomous agents, the major workflow commands also support `
 ## Further Reading
 
 - Installation: [docs/installation.md](docs/installation.md)
-- Automation: [docs/automation.md](docs/automation.md)
+- Python notebooks / pandas / polars: [docs/python-dataframes.md](docs/python-dataframes.md)
 - Ingest guide: [docs/ingest.md](docs/ingest.md)
 - Query surface reference: [docs/query-surface.md](docs/query-surface.md)
 - Structured results: [docs/structured-results.md](docs/structured-results.md)
+- Automation: [docs/automation.md](docs/automation.md)
+- Identifier conventions: [docs/identifier-conventions.md](docs/identifier-conventions.md)
 - Architecture: [docs/architecture.md](docs/architecture.md)
 - Testing and validation: [docs/testing.md](docs/testing.md)
 - Developer guide: [docs/developer-guide.md](docs/developer-guide.md)
+- Changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ## Skills
 

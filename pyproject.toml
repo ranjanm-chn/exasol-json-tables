@@ -8,9 +8,14 @@ version = "0.1.0"
 description = "Exasol JSON Tables: ingest, query, and reshape JSON-shaped data in Exasol."
 readme = "README.md"
 license = {file = "LICENSE"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
-  "pyexasol",
+  "pyexasol>=2.2.0,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy==1.20.*",
 ]
 
 [project.scripts]
@@ -21,3 +26,11 @@ package-dir = {"" = "python"}
 
 [tool.setuptools.packages.find]
 where = ["python"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["python/exasol_json_tables"]
+warn_unused_configs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true

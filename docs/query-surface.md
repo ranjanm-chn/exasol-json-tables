@@ -22,6 +22,58 @@ ALTER SESSION SET SQL_PREPROCESSOR_SCRIPT = JVS_WRAP_PP.JSON_WRAPPER_PREPROCESSO
 
 Without that activation, the wrapper views still exist, but the extra JSON syntax sugar such as dotted paths and bracket access will not be rewritten.
 
+If you query wrapper views from Python via PyExasol, treat `execute()` plus `fetchall()` as the primary interface for wrapper-syntax queries. PyExasol implements `export_to_pandas()` through `EXPORT ... INTO CSV`. On the current stack, simple root-wrapper queries can work when the preprocessor is active, but iterator-heavy wrapper syntax is still unreliable there and often degrades into an opaque `EmptyDataError` / `ExaExportError` chain. For notebook work, execute the wrapper query directly and build the DataFrame yourself:
+
+```python
+stmt = con.execute('SELECT "meta.info.note" FROM "JSON_VIEW"."SAMPLE" ORDER BY "_id"')
+columns = list(stmt.columns())
+rows = stmt.fetchall()
+```
+
+If you want `export_to_pandas()`, first publish an ordinary view or table with explicit casts and SQL-safe aliases, then export that durable object. See [python-dataframes.md](python-dataframes.md).
+
+## Identifier Discipline
+
+There are two different naming concerns on the wrapper surface:
+
+- wrapper expressions and JSON property references
+- durable SQL-facing column aliases for published views or export tables
+
+Keep wrapper expressions quoted:
+
+```sql
+SELECT
+  "child.value",
+  "meta.info.note",
+  "tags[LAST]"
+FROM JSON_VIEW.SAMPLE;
+```
+
+But when you publish a durable view or table for downstream SQL, prefer uppercase SQL-safe aliases:
+
+```sql
+CREATE VIEW ANALYTICS.SAMPLE_EXPORT AS
+SELECT
+  CAST("id" AS VARCHAR(20)) AS DOC_ID,
+  CAST("meta.info.note" AS VARCHAR(200)) AS DEEP_NOTE,
+  CAST("tags[LAST]" AS VARCHAR(50)) AS LAST_TAG
+FROM JSON_VIEW.SAMPLE;
+```
+
+That keeps downstream queries simple:
+
+```sql
+SELECT DOC_ID, DEEP_NOTE
+FROM ANALYTICS.SAMPLE_EXPORT
+ORDER BY DOC_ID;
+```
+
+If you instead publish lowercase quoted aliases such as `"doc_id"`, later SQL must keep quoting them.
+
+Also treat names such as `source`, `schema`, `value`, and `type` as risky durable aliases. They may work when quoted, but a safer default is a SQL-friendly alias such as `SOURCE_SITE`, `VALUE_TEXT`, or `EVENT_TYPE`.
+
+For a fuller set of conventions, see [identifier-conventions.md](identifier-conventions.md).
+
 ## Supported Surface
 
 ### Helper Functions
@@ -45,11 +97,20 @@ Without that activation, the wrapper views still exist, but the extra JSON synta
 - array rowset syntax such as `JOIN item IN s."items"` and `JOIN VALUE tag IN s."tags"`
 - iterator-row path and bracket access such as `item."nested.note"` and `entry."extras[LAST]"`
 
+`[PARAM]` still requires a client that actually sends prepared parameters. It is safe for prepared-statement-capable clients, but plain Python string execution with `execute("...")` does not magically turn it into a bound parameter.
+
 ## Core Semantics
 
 ### Final JSON Output With `TO_JSON`
 
 `TO_JSON` is the primary final outlet when you want JSON back out of a query.
+
+The examples below use the uppercase fixture views such as `JSON_VIEW.SAMPLE`. Real installed wrapper roots often keep the ingested table name, which may be lowercase. In that case, quote the public view exactly, for example:
+
+```sql
+SELECT TO_JSON(*) AS doc_json
+FROM "EJT_CUSTOMER_EVENTS_VIEW"."customer_events";
+```
 
 On wrapped roots, it serializes the row recursively:
 
@@ -122,6 +183,8 @@ When a variant contains a non-scalar branch:
 - if `JSON_TYPEOF(expr) = 'OBJECT'`, traverse it with normal dotted paths such as `expr."note"` or `"flex.note"`
 - if `JSON_TYPEOF(expr) = 'ARRAY'`, use bracket access or rowset expansion such as `"flex[LAST].value"` or `JOIN item IN row."flex"`
 - `JSON_AS_VARCHAR(...)`, `JSON_AS_DECIMAL(...)`, and `JSON_AS_BOOLEAN(...)` are scalar extractors; object and array branches return `NULL` from those helpers until you navigate to a scalar child
+- use these helpers on variant-style fields such as `"value"` or `"flex"`, where the per-row JSON type can vary
+- do not use `JSON_TYPEOF(...)` as the primary inspection tool for structural wrapper branches whose visible columns are fixed object/array markers such as `child|object` or `tags|array`; traverse those branches, expand them, or serialize them with `TO_JSON(...)` instead
 
 Example:
 
@@ -282,11 +345,13 @@ JOIN JVS_DIM.DOC_FLAGS f
 ## Known Boundaries
 
 - The preprocessor is session-local. Activate it in the SQL session where you want wrapper syntax.
+- PyExasol `export_to_pandas()` runs `EXPORT ... INTO CSV` under the hood. Simple root-wrapper queries may work when the preprocessor is active, but wrapper syntax that depends on iterator rewrites is still unreliable there. Use `execute()` plus `fetchall()` for exploratory wrapper queries, or export a published ordinary view/table instead.
 - In joined queries, qualify root-document helper arguments with the root alias, for example `JSON_IS_EXPLICIT_NULL(s."note")`.
 - `TO_JSON(*)` is the primary final-output surface on wrapped roots, but joined wrapper queries must use qualified top-level subsets such as `TO_JSON(s."id", s."meta")`.
 - On ordinary tables and ordinary views, `TO_JSON` is a flat row serializer and joined queries should use `TO_JSON(alias.*)` or qualified columns.
 - Path/helper syntax does not start from derived-table roots yet. Move the JSON expression into the inner `SELECT` or query the wrapper view directly.
 - `VALUE` iterators support plain SQL on the scalar value, but JSON helper/path syntax is intentionally not supported on them.
+- `method` is an unsafe iterator alias. `JOIN VALUE method IN s."tags"` may parse, but later references such as `SELECT method` or `WHERE method = 'x'` are rewritten into a broken `METHOD_` token. Use aliases such as `tag`, `entry`, or `raw_method` instead.
 - Use `JSON_TYPEOF(...)` and `JSON_AS_*` for JSON-aware variant semantics. Built-in `TYPEOF(...)` and plain `CAST(...)` reflect wrapper view SQL types, not the original per-row JSON type contract.
 
 ## Where To Go Next

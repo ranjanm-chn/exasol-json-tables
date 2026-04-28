@@ -21,6 +21,8 @@ On failure, `status` becomes `"error"` and `errors` contains a structured machin
 
 Human-oriented progress logs still go to stderr.
 
+If your automation generates durable views or tables for downstream SQL consumers, also follow the aliasing rules in [identifier-conventions.md](identifier-conventions.md). The short version is: keep wrapper property references quoted, but prefer uppercase SQL-safe aliases on exported objects.
+
 ## Main Commands
 
 ### `ingest-and-wrap --json`
@@ -48,6 +50,8 @@ The JSON summary includes:
   The detailed wrapper package summary
 - `validation`
   The installed-package validation report when validation ran
+
+For wrapper-installing workflows, `objects.publicViews`, `nextActions.publicViews`, and `wrapper.publicViews` expose the actual public view names created inside the wrapper schema. `--name` controls the derived schema/package names, not the public view names themselves.
 
 ### `validate --json`
 
@@ -97,6 +101,8 @@ The description includes:
 
 - root views
 - top-level fields
+- recursive `fieldTree` discovery per root for nested object and object-array branches
+- `familyTables` entries per root so agents can map helper-table names back to paths such as `meta.info` or `items[]`
 - object and array fields
 - example `TO_JSON(*)`, helper, and rowset queries
 - activation SQL when the package config is available
@@ -119,7 +125,7 @@ The response includes:
 
 - `discovery` metadata showing whether the helper schema was autodiscovered
 - `installedState` from live catalog metadata
-- the wrapped roots, fields, and example queries
+- the wrapped roots, fields, recursive `fieldTree` data, per-root `familyTables`, and example queries
 
 If you do not provide the preprocessor schema and script, the describe output still works, but it cannot emit `activationSql`.
 

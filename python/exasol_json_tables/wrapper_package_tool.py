@@ -16,8 +16,12 @@ from .generate_json_export_helper_sql import (
     install_json_export_helpers,
 )
 from .generate_json_export_views_sql import install_json_export_views
-from .generate_json_export_views_sql import json_export_root_names_from_wrapper_manifest
-from .generate_preprocessor_sql import validate_identifier
+from .generate_json_export_views_sql import json_export_view_name
+from .generate_preprocessor_library_sql import (
+    generate_preprocessor_library_sql_text,
+    install_preprocessor_library,
+)
+from .generate_preprocessor_sql import DEFAULT_PREPROCESSOR_LIBRARY_SCRIPT, validate_identifier
 from .generate_wrapper_preprocessor_sql import (
     DEFAULT_EXPLICIT_NULL_FUNCTION_NAMES,
     DEFAULT_TO_JSON_FUNCTION_NAMES,
@@ -169,9 +173,29 @@ def parse_args() -> argparse.Namespace:
 
 
 def add_connection_arguments(parser: argparse.ArgumentParser, *, required: bool = False) -> None:
-    parser.add_argument("--dsn", default="127.0.0.1:8563" if not required else None, help="Exasol DSN.")
-    parser.add_argument("--user", default="sys" if not required else None, help="Exasol user.")
-    parser.add_argument("--password", default="exasol" if not required else None, help="Exasol password.")
+    if "--dsn" not in parser._option_string_actions:
+        parser.add_argument("--dsn", default="127.0.0.1:8563" if not required else None, help="Exasol DSN.")
+    if "--user" not in parser._option_string_actions:
+        parser.add_argument("--user", default="sys" if not required else None, help="Exasol user.")
+    if "--password" not in parser._option_string_actions:
+        parser.add_argument("--password", default="exasol" if not required else None, help="Exasol password.")
+    if "--validate-server-certificate" not in parser._option_string_actions:
+        parser.add_argument(
+            "--validate-server-certificate",
+            action="store_true",
+            default=False,
+            help="Validate the Exasol server certificate. Default: disabled.",
+        )
+    if "--no-tls" not in parser._option_string_actions:
+        parser.add_argument(
+            "--no-tls",
+            action="store_true",
+            default=False,
+            help=(
+                "Accepted for CLI consistency with ingest commands. Python-side database connections do not validate "
+                "server certificates unless --validate-server-certificate is supplied."
+            ),
+        )
 
 
 def add_package_config_argument(parser: argparse.ArgumentParser) -> None:
@@ -307,6 +331,7 @@ def build_package_paths(output_dir: Path, package_name: str) -> dict[str, Path]:
     return {
         "viewsSql": output_dir / f"{package_name}_views.sql",
         "manifest": output_dir / f"{package_name}_manifest.json",
+        "preprocessorLibrarySql": output_dir / f"{package_name}_preprocessor_library.sql",
         "preprocessorSql": output_dir / f"{package_name}_preprocessor.sql",
         "packageConfig": output_dir / f"{package_name}_package.json",
         "resultFamilyConfig": output_dir / f"{package_name}_result_family.json",
@@ -386,6 +411,7 @@ def package_config_from_args(args: argparse.Namespace, paths: dict[str, Path]) -
         "preprocessor": {
             "schema": preprocessor_schema,
             "script": preprocessor_script,
+            "libraryScript": DEFAULT_PREPROCESSOR_LIBRARY_SCRIPT,
             "activateSession": bool(args.activate_session),
         },
         "helperProfile": {
@@ -401,6 +427,7 @@ def package_config_from_args(args: argparse.Namespace, paths: dict[str, Path]) -
         "generatedFiles": {
             "viewsSql": relative_path_text(paths["viewsSql"], base_dir=output_dir),
             "manifest": relative_path_text(paths["manifest"], base_dir=output_dir),
+            "preprocessorLibrarySql": relative_path_text(paths["preprocessorLibrarySql"], base_dir=output_dir),
             "preprocessorSql": relative_path_text(paths["preprocessorSql"], base_dir=output_dir),
         },
     }
@@ -456,6 +483,14 @@ def resolve_result_family_manifest_path(config_path: Path, config: dict[str, Any
     return resolve_configured_path(config_path, config["resultFamily"]["materializedFamilyManifest"]).resolve()
 
 
+def resolve_preprocessor_library_sql_path(config_path: Path, config: dict[str, Any]) -> Path | None:
+    generated_files = config.get("generatedFiles", {})
+    relative_path = generated_files.get("preprocessorLibrarySql")
+    if relative_path is None:
+        return None
+    return resolve_configured_path(config_path, relative_path).resolve()
+
+
 def generate_preprocessor_from_package_config(config: dict[str, Any], manifest: dict[str, Any]) -> str:
     helper_profile = config["helperProfile"]
     preprocessor_config = config["preprocessor"]
@@ -474,6 +509,14 @@ def generate_preprocessor_from_package_config(config: dict[str, Any], manifest: 
         blocked_helper_names=helper_profile["blockedHelperNames"],
         blocked_helper_message=helper_profile["blockedHelperMessage"],
         activate_session=bool(preprocessor_config["activateSession"]),
+    )
+
+
+def generate_preprocessor_library_from_package_config(config: dict[str, Any]) -> str:
+    preprocessor_config = config["preprocessor"]
+    return generate_preprocessor_library_sql_text(
+        preprocessor_config["schema"],
+        preprocessor_config.get("libraryScript") or DEFAULT_PREPROCESSOR_LIBRARY_SCRIPT,
     )
 
 
@@ -531,12 +574,11 @@ def strip_leading_comments(sql_text: str) -> str:
     return "\n".join(lines[index:]).strip() + "\n"
 
 
-def execute_generated_preprocessor_sql(con, sql_text: str) -> None:
+def execute_generated_script_sql(con, sql_text: str, marker: str) -> None:
     cleaned = strip_leading_comments(sql_text)
-    marker = "CREATE OR REPLACE LUA PREPROCESSOR SCRIPT "
     marker_index = cleaned.find(marker)
     if marker_index == -1:
-        raise ValueError("Generated preprocessor SQL is missing CREATE OR REPLACE LUA PREPROCESSOR SCRIPT.")
+        raise ValueError(f"Generated script SQL is missing {marker.strip()!r}.")
 
     prefix_sql = cleaned[:marker_index].strip()
     if prefix_sql:
@@ -553,6 +595,14 @@ def execute_generated_preprocessor_sql(con, sql_text: str) -> None:
     suffix_sql = script_tail[script_end_index + len(script_end_marker):].strip()
     if suffix_sql:
         execute_plain_sql_file(con, suffix_sql)
+
+
+def execute_generated_preprocessor_sql(con, sql_text: str) -> None:
+    execute_generated_script_sql(con, sql_text, "CREATE OR REPLACE LUA PREPROCESSOR SCRIPT ")
+
+
+def execute_generated_preprocessor_library_sql(con, sql_text: str) -> None:
+    execute_generated_script_sql(con, sql_text, "CREATE OR REPLACE SCRIPT ")
 
 
 def encode_quoted_identifier(identifier: str) -> str:
@@ -926,13 +976,22 @@ def json_safe_rows(rows: list[tuple[Any, ...]], *, limit: int = 3) -> list[list[
     return [[json_safe_scalar(value) for value in row] for row in rows[:limit]]
 
 
-def validate_package_files(config_path: Path, config: dict[str, Any], manifest_path: Path, views_sql_path: Path, preprocessor_sql_path: Path) -> None:
+def validate_package_files(
+    config_path: Path,
+    config: dict[str, Any],
+    manifest_path: Path,
+    views_sql_path: Path,
+    preprocessor_sql_path: Path,
+    preprocessor_library_sql_path: Path | None = None,
+) -> None:
     if not views_sql_path.exists():
         raise SystemExit(f"Wrapper views SQL file does not exist: {views_sql_path}")
     if not manifest_path.exists():
         raise SystemExit(f"Manifest file does not exist: {manifest_path}")
     if not preprocessor_sql_path.exists():
         raise SystemExit(f"Preprocessor SQL file does not exist: {preprocessor_sql_path}")
+    if preprocessor_library_sql_path is not None and not preprocessor_library_sql_path.exists():
+        raise SystemExit(f"Preprocessor library SQL file does not exist: {preprocessor_library_sql_path}")
     if config["wrapperSchema"] == config["helperSchema"]:
         raise SystemExit("Wrapper schema and helper schema must differ in the package config.")
     if config["sourceSchema"] in {config["wrapperSchema"], config["helperSchema"]}:
@@ -950,12 +1009,9 @@ def validate_package_files(config_path: Path, config: dict[str, Any], manifest_p
 
 
 def expected_helper_object_names_for_manifest(manifest: dict[str, Any]) -> set[str]:
-    helper_schema = str(manifest["helperSchema"])
     expected_helper_objects = {table["tableName"] for table in manifest["tables"]}
     expected_helper_objects.update({"__JVS_ROOTS", "__JVS_RELATIONSHIPS", "__JVS_COLUMN_MEMBERS"})
-    expected_helper_objects.update(
-        root_names.view_name for root_names in json_export_root_names_from_wrapper_manifest(manifest, schema=helper_schema).values()
-    )
+    expected_helper_objects.update(json_export_view_name(str(table["tableName"])) for table in manifest["tables"])
     return expected_helper_objects
 
 
@@ -1058,6 +1114,7 @@ def validate_installed_package(con, config: dict[str, Any], manifest: dict[str, 
 
     script_schema = config["preprocessor"]["schema"]
     script_name = config["preprocessor"]["script"]
+    library_script_name = config["preprocessor"].get("libraryScript") or DEFAULT_PREPROCESSOR_LIBRARY_SCRIPT
     script_rows = con.execute(
         f"""
         SELECT COUNT(*)
@@ -1068,6 +1125,16 @@ def validate_installed_package(con, config: dict[str, Any], manifest: dict[str, 
     ).fetchone()
     if script_rows is None or int(script_rows[0]) != 1:
         raise SystemExit(f"Installed preprocessor script {script_schema}.{script_name} was not found.")
+    library_rows = con.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM SYS.EXA_ALL_SCRIPTS
+        WHERE SCRIPT_SCHEMA = '{script_schema}'
+          AND SCRIPT_NAME = '{library_script_name}'
+        """
+    ).fetchone()
+    if library_rows is None or int(library_rows[0]) != 1:
+        raise SystemExit(f"Installed preprocessor library script {script_schema}.{library_script_name} was not found.")
 
     missing_helper_scripts = list(metadata_summary["integrity"]["missingHelperScripts"])
     if missing_helper_scripts:
@@ -1148,10 +1215,18 @@ def build_validation_report(args: argparse.Namespace) -> tuple[dict[str, Any], d
     config = load_package_config(config_path)
     manifest_path = (args.manifest or resolve_configured_path(config_path, config["generatedFiles"]["manifest"])).resolve()
     views_sql_path = (args.views_sql or resolve_configured_path(config_path, config["generatedFiles"]["viewsSql"])).resolve()
+    preprocessor_library_sql_path = resolve_preprocessor_library_sql_path(config_path, config)
     preprocessor_sql_path = (
         args.preprocessor_sql or resolve_configured_path(config_path, config["generatedFiles"]["preprocessorSql"])
     ).resolve()
-    validate_package_files(config_path, config, manifest_path, views_sql_path, preprocessor_sql_path)
+    validate_package_files(
+        config_path,
+        config,
+        manifest_path,
+        views_sql_path,
+        preprocessor_sql_path,
+        preprocessor_library_sql_path,
+    )
     manifest = load_manifest_and_validate(config, manifest_path)
     result_family_manifest_path = resolve_result_family_manifest_path(config_path, config)
     result_family_manifest = (
@@ -1165,6 +1240,9 @@ def build_validation_report(args: argparse.Namespace) -> tuple[dict[str, Any], d
         "files": {
             "manifest": str(manifest_path),
             "viewsSql": str(views_sql_path),
+            "preprocessorLibrarySql": (
+                str(preprocessor_library_sql_path) if preprocessor_library_sql_path is not None else None
+            ),
             "preprocessorSql": str(preprocessor_sql_path),
         },
         "checkedInstalled": bool(args.check_installed),
@@ -1241,11 +1319,13 @@ def command_generate(args: argparse.Namespace) -> None:
     paths["viewsSql"].parent.mkdir(parents=True, exist_ok=True)
     paths["viewsSql"].write_text(artifacts.sql)
     write_json(paths["manifest"], artifacts.manifest)
+    paths["preprocessorLibrarySql"].write_text(generate_preprocessor_library_from_package_config(config))
     paths["preprocessorSql"].write_text(generate_preprocessor_from_package_config(config, artifacts.manifest))
     write_json(paths["packageConfig"], config)
 
     print(f"Wrote {paths['viewsSql']}")
     print(f"Wrote {paths['manifest']}")
+    print(f"Wrote {paths['preprocessorLibrarySql']}")
     print(f"Wrote {paths['preprocessorSql']}")
     print(f"Wrote {paths['packageConfig']}")
 
@@ -1285,6 +1365,7 @@ def command_generate_result_family_package(args: argparse.Namespace) -> None:
     write_json(paths["resultFamilyManifest"], materialized_family_result_to_dict(materialized_family))
     paths["viewsSql"].write_text(artifacts.sql)
     write_json(paths["manifest"], artifacts.manifest)
+    paths["preprocessorLibrarySql"].write_text(generate_preprocessor_library_from_package_config(config))
     paths["preprocessorSql"].write_text(generate_preprocessor_from_package_config(config, artifacts.manifest))
     write_json(paths["packageConfig"], config)
 
@@ -1292,6 +1373,7 @@ def command_generate_result_family_package(args: argparse.Namespace) -> None:
     print(f"Wrote {paths['resultFamilyManifest']}")
     print(f"Wrote {paths['viewsSql']}")
     print(f"Wrote {paths['manifest']}")
+    print(f"Wrote {paths['preprocessorLibrarySql']}")
     print(f"Wrote {paths['preprocessorSql']}")
     print(f"Wrote {paths['packageConfig']}")
 
@@ -1302,23 +1384,36 @@ def command_regenerate_preprocessor(args: argparse.Namespace) -> None:
     manifest_path = args.manifest or resolve_configured_path(config_path, config["generatedFiles"]["manifest"])
     manifest = load_manifest_and_validate(config, manifest_path)
     output_path = (args.output or resolve_configured_path(config_path, config["generatedFiles"]["preprocessorSql"])).resolve()
+    library_output_path = resolve_preprocessor_library_sql_path(config_path, config)
     regenerated_config = json.loads(json.dumps(config))
     if args.activate_session:
         regenerated_config["preprocessor"]["activateSession"] = True
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(generate_preprocessor_from_package_config(regenerated_config, manifest))
     print(f"Wrote {output_path}")
+    if args.output is None and library_output_path is not None:
+        library_output_path.parent.mkdir(parents=True, exist_ok=True)
+        library_output_path.write_text(generate_preprocessor_library_from_package_config(regenerated_config))
+        print(f"Wrote {library_output_path}")
 
 
 def command_install(args: argparse.Namespace) -> None:
     config_path = args.package_config.resolve()
     config = load_package_config(config_path)
     views_sql_path = (args.views_sql or resolve_configured_path(config_path, config["generatedFiles"]["viewsSql"])).resolve()
+    preprocessor_library_sql_path = resolve_preprocessor_library_sql_path(config_path, config)
     preprocessor_sql_path = (
         args.preprocessor_sql or resolve_configured_path(config_path, config["generatedFiles"]["preprocessorSql"])
     ).resolve()
     manifest_path = resolve_configured_path(config_path, config["generatedFiles"]["manifest"]).resolve()
-    validate_package_files(config_path, config, manifest_path, views_sql_path, preprocessor_sql_path)
+    validate_package_files(
+        config_path,
+        config,
+        manifest_path,
+        views_sql_path,
+        preprocessor_sql_path,
+        preprocessor_library_sql_path,
+    )
     manifest = load_manifest_and_validate(config, manifest_path)
     result_family_config_path = resolve_result_family_config_path(config_path, config)
     result_family_spec = load_result_family_spec(result_family_config_path) if result_family_config_path else None
@@ -1350,6 +1445,14 @@ def command_install(args: argparse.Namespace) -> None:
                 schema=config["helperSchema"],
                 udf_schema=config["helperSchema"],
             )
+            if preprocessor_library_sql_path is not None:
+                execute_generated_preprocessor_library_sql(con, preprocessor_library_sql_path.read_text())
+            else:
+                install_preprocessor_library(
+                    con,
+                    config["preprocessor"]["schema"],
+                    config["preprocessor"].get("libraryScript") or DEFAULT_PREPROCESSOR_LIBRARY_SCRIPT,
+                )
             execute_generated_preprocessor_sql(con, preprocessor_sql_path.read_text())
         if args.activate_session:
             con.execute(build_activation_sql(config, include_semicolon=False))
@@ -1362,6 +1465,8 @@ def command_install(args: argparse.Namespace) -> None:
     if not args.skip_views:
         print(f"Installed {views_sql_path}")
     if not args.skip_preprocessor:
+        if preprocessor_library_sql_path is not None:
+            print(f"Installed {preprocessor_library_sql_path}")
         print(f"Installed {preprocessor_sql_path}")
     print_install_next_steps(config, smoke_test_sql)
     if args.activate_session:

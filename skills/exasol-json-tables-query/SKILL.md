@@ -38,6 +38,7 @@ Start with:
 - `README.md`
 - `docs/query-surface.md`
 - `docs/installation.md`
+- `docs/identifier-conventions.md`
 - `python/exasol_json_tables/generate_preprocessor_sql.py`
 - `python/exasol_json_tables/generate_wrapper_preprocessor_sql.py`
 - `python/exasol_json_tables/generate_wrapper_views_sql.py`
@@ -46,6 +47,10 @@ Start with:
 
 Most important tests:
 
+- `tests/test_preprocessor_library_builder.py`
+- `tools/test_nano_preprocessor_parser_lane.py`
+- `tests/test_preprocessor_refactor_phase0.py`
+- `tests/test_preprocessor_early_out.py`
 - `tests/test_wrapper_surface.py`
 - `tests/test_wrapper_to_json.py`
 - `tests/test_regular_table_to_json.py`
@@ -55,7 +60,7 @@ Most important tests:
 - `tests/test_unified_cli.py`
 - `tests/test_wrapper_variant_semantics.py`
 
-For agented workflow commands such as `ingest-and-wrap`, `wrap generate`, `wrap install`, `wrap deploy`, and `validate`, prefer `--json`. The JSON summary includes package paths, activation SQL, smoke-test SQL, schema names, wrapper-scope warnings, and installed validation probes. Use `describe package --json` or `describe wrapper --json` when you need to inspect the available roots and example queries.
+For agented workflow commands such as `ingest-and-wrap`, `wrap generate`, `wrap install`, `wrap deploy`, and `validate`, prefer `--json`. The JSON summary includes package paths, activation SQL, smoke-test SQL, schema names, wrapper-scope warnings, and installed validation probes. Use `describe package --json` or `describe wrapper --json` when you need to inspect the available roots and example queries. `describe wrapper --json` now also includes recursive `fieldTree` data and per-root `familyTables`, so agents should use that instead of guessing nested field names.
 
 ## Mental Model
 
@@ -106,6 +111,8 @@ The preprocessor is not optional sugar from a product perspective. It is part of
 
 - use `JSON_TYPEOF(...)` and `JSON_AS_*`
 - built-in `TYPEOF(...)` and plain `CAST(...)` reflect wrapper SQL types, not per-row JSON type contract
+- use `JSON_TYPEOF(...)` mainly on variant-style fields where the per-row JSON type can change
+- for structural wrapper branches backed by fixed object/array markers, traverse them, expand them, or serialize them with `TO_JSON(...)` instead of treating them like late-bound runtime `VARIANT`
 
 ### Array semantics
 
@@ -114,6 +121,7 @@ The preprocessor is not optional sugar from a product perspective. It is part of
 - use `[SIZE]` for array length without unnesting
 - use `[field_name]` for current-row dynamic selectors such as `"items[id]"`
 - use `[?]` for placeholder-based dynamic selectors
+- treat `[PARAM]` as a prepared-statement-only spelling; plain Python string execution does not make it work
 - use `JOIN ... IN ...` for rowset semantics
 - arbitrary SQL expressions inside brackets are intentionally rejected
 - do not allow Mongo-style `"items.value"` style traversal through arrays; it should fail with guidance
@@ -144,6 +152,10 @@ The preprocessor is not optional sugar from a product perspective. It is part of
 
 Use these as the main regression surface:
 
+- dedicated parser-heavy lane:
+  - `python3 tools/test_nano_preprocessor_parser_lane.py`
+- preprocessor parser/stability baseline:
+  - `python3 tests/test_preprocessor_refactor_phase0.py`
 - wrapper semantics:
   - `python3 tests/test_wrapper_surface.py`
 - wrapper `TO_JSON(...)` semantics:
@@ -167,6 +179,11 @@ Run Nano-backed tests sequentially when they rebuild the same schemas.
 
 - Treat the wrapper surface as a product contract, not an internal convenience layer.
 - Treat `TO_JSON(...)` as part of that product contract, not as a secondary helper.
+- Keep wrapper property references quoted exactly as required by the surface, for example `"meta.info.note"` or `item."nested.value"`.
+- When generating a durable published view or export table for downstream SQL, prefer uppercase SQL-safe aliases by default.
+- Avoid reserved-word aliases such as `source`, `schema`, `value`, `type`, `table`, or `timestamp` unless the user explicitly wants quoted identifiers.
+- If an alias would naturally collide with a reserved word, pick a descriptive replacement such as `SOURCE_SITE`, `VALUE_TEXT`, `EVENT_TYPE`, or `ORDER_TS`.
+- Separate SQL-facing alias ergonomics from JSON payload ergonomics: use uppercase aliases for durable SQL objects, but keep natural property names inside `TO_JSON(...)` output.
 - Prefer explicit `JVS-*` errors over leaking raw SQL resolution failures when misuse is predictable.
 - Be careful about scope:
   - helper/path syntax should only activate on allowed wrapper schemas
@@ -177,6 +194,10 @@ Run Nano-backed tests sequentially when they rebuild the same schemas.
 - Keep install/activation guidance aligned with package-tool behavior.
 - Prefer `--json` for wrapper lifecycle commands instead of scraping printed next-step text.
 - Treat `validate --json` as the authoritative capability signal for automation, not a generic green/no-green string.
+- When a user complains about quoting friction, first decide whether they need:
+  - a wrapper query in the current session
+  - or a durable published SQL object
+  The fix is often alias strategy, not query-surface behavior.
 
 ## Current Boundaries
 

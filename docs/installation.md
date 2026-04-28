@@ -12,7 +12,7 @@ That command is provided by the Python package defined in [pyproject.toml](../py
 
 For the full workflow, you need:
 
-- Python 3.9 or newer
+- Python 3.10 or newer
 - Rust and Cargo, if you want to run the ingest stage from this repo
 - access to an Exasol database
 
@@ -72,6 +72,8 @@ That command:
 5. validates it
 
 If you do not pass explicit connection arguments, this path assumes the local Nano-style defaults described below. For other environments, provide `--dsn`, `--user`, `--password`, or an explicit ingest `--exasol` URL.
+
+`--name` controls the derived schema/package names for the workflow. The installed public view names still come from the ingested root tables. The command's JSON output, smoke-test SQL, and `describe ... --json` responses all report those actual public view names explicitly.
 
 After installation, activate the wrapper syntax in the SQL session where you want to query the data:
 
@@ -148,6 +150,8 @@ FROM JSON_VIEW.SAMPLE;
 
 After the view is created, other sessions can query `ANALYTICS.SAMPLE_PUBLISHED` without activating the JSON Tables preprocessor.
 
+When you create published objects for downstream SQL, BI, or pandas-style access, prefer uppercase aliases so later queries do not need quoted lowercase identifiers everywhere. See [identifier-conventions.md](identifier-conventions.md) and [python-dataframes.md](python-dataframes.md).
+
 Use a published view when:
 
 - you want a permanent read surface
@@ -159,6 +163,8 @@ Use a published table when:
 - you want a stable snapshot
 - you want to hand off a precomputed result
 - you are comfortable rebuilding or refreshing it when the source changes
+
+Also avoid exposing reserved-word aliases such as `source`, `schema`, `value`, or `type` on durable published objects unless you quote them intentionally. In most cases, a SQL-safe alias such as `SOURCE_SITE`, `VALUE_TEXT`, or `EVENT_TYPE` is a better default.
 
 The regression behind the published-view pattern is also [tests/test_access_modes.py](../tests/test_access_modes.py).
 

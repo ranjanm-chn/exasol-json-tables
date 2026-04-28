@@ -9,7 +9,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT = ROOT / "dist" / "json_preprocessor.sql"
+DEFAULT_PREPROCESSOR_LIBRARY_SCRIPT = "JVS_PREPROCESSOR_LIB"
 IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+WrapperGroupDetail = dict[str, object]
+WrapperTableGroupConfig = dict[str, WrapperGroupDetail]
+WrapperGroupConfig = dict[str, dict[str, WrapperTableGroupConfig]]
+WrapperVisibleColumnConfig = dict[str, dict[str, dict[str, bool]]]
+WrapperToJsonConfig = dict[str, dict[str, dict[str, object]]]
 
 
 def parse_args() -> argparse.Namespace:
@@ -100,26 +106,72 @@ def lua_quote_string(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def render_lua_string_table(mapping: dict[str, object], indent: int = 0) -> str:
+def render_lua_value(value: object, indent: int = 0) -> str:
     indentation = " " * indent
     child_indentation = " " * (indent + 4)
-    if not mapping:
-        return "{}"
-    lines = ["{"]
-    for key in sorted(mapping):
-        value = mapping[key]
-        rendered_key = f"[{lua_quote_string(key)}]"
-        if isinstance(value, dict):
-            rendered_value = render_lua_string_table(value, indent + 4)
-        elif value is True:
-            rendered_value = "true"
-        elif value is False or value is None:
-            rendered_value = "false"
-        else:
-            rendered_value = lua_quote_string(str(value))
-        lines.append(f"{child_indentation}{rendered_key} = {rendered_value},")
-    lines.append(f"{indentation}}}")
-    return "\n".join(lines)
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        lines = ["{"]
+        for key in sorted(value):
+            rendered_key = f"[{lua_quote_string(key)}]"
+            rendered_value = render_lua_value(value[key], indent + 4)
+            lines.append(f"{child_indentation}{rendered_key} = {rendered_value},")
+        lines.append(f"{indentation}}}")
+        return "\n".join(lines)
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return "{}"
+        lines = ["{"]
+        for item in value:
+            lines.append(f"{child_indentation}{render_lua_value(item, indent + 4)},")
+        lines.append(f"{indentation}}}")
+        return "\n".join(lines)
+    if value is True:
+        return "true"
+    if value is False or value is None:
+        return "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return lua_quote_string(str(value))
+
+
+def render_lua_string_table(mapping: dict[str, object], indent: int = 0) -> str:
+    return render_lua_value(mapping, indent)
+
+
+def _build_preprocessor_config(
+    *,
+    function_names: list[str],
+    blocked_function_names: list[str],
+    blocked_function_message: str,
+    allowed_schemas: list[str],
+    helper_schema_map: dict[str, str],
+    wrapper_group_config: WrapperGroupConfig | None,
+    wrapper_visible_column_config: WrapperVisibleColumnConfig | None,
+    wrapper_to_json_config: WrapperToJsonConfig | None,
+    regular_to_json_row_object_function: str | None,
+    rewrite_path_identifiers: bool,
+    helper_function_kinds: dict[str, str] | None = None,
+) -> dict[str, object]:
+    helper_function_kinds = helper_function_kinds or {name: "explicit_null" for name in function_names}
+    example_allowed_schema = allowed_schemas[0] if allowed_schemas else "JSON_VIEW"
+    helper_rewrite_mode = "wrapper" if wrapper_group_config else "marker"
+    return {
+        "helper_kind_by_name": helper_function_kinds,
+        "blocked_functions": {name: True for name in blocked_function_names},
+        "blocked_function_message": blocked_function_message,
+        "allowed_json_schemas": {name: True for name in allowed_schemas},
+        "allowed_json_schema_list": ", ".join(allowed_schemas),
+        "example_allowed_schema": example_allowed_schema,
+        "helper_schema_by_allowed_schema": dict(sorted(helper_schema_map.items())),
+        "group_config_by_schema_and_table": wrapper_group_config or {},
+        "visible_columns_by_schema_and_table": wrapper_visible_column_config or {},
+        "to_json_config_by_schema_and_table": wrapper_to_json_config or {},
+        "regular_to_json_row_object_function": regular_to_json_row_object_function or "",
+        "helper_rewrite_mode": helper_rewrite_mode,
+        "rewrite_path_identifiers": rewrite_path_identifiers,
+    }
 
 
 COMMON_LUA = """
@@ -169,45 +221,46 @@ COMMON_LUA = """
     end
 
     local function tokenize_path_sql(sqltext)
+        local canonical_sqltext = table.concat(sqlparsing.tokenize(sqltext))
         local tokens = {}
         local index = 1
-        while index <= #sqltext do
-            local ch = string.sub(sqltext, index, index)
-            local next_ch = string.sub(sqltext, index + 1, index + 1)
+        while index <= #canonical_sqltext do
+            local ch = string.sub(canonical_sqltext, index, index)
+            local next_ch = string.sub(canonical_sqltext, index + 1, index + 1)
             if string.match(ch, "%s") then
                 local start_index = index
                 repeat
                     index = index + 1
-                    ch = string.sub(sqltext, index, index)
-                until index > #sqltext or not string.match(ch, "%s")
-                tokens[#tokens + 1] = {type = "whitespace", text = string.sub(sqltext, start_index, index - 1)}
+                    ch = string.sub(canonical_sqltext, index, index)
+                until index > #canonical_sqltext or not string.match(ch, "%s")
+                tokens[#tokens + 1] = {type = "whitespace", text = string.sub(canonical_sqltext, start_index, index - 1)}
             elseif ch == "-" and next_ch == "-" then
                 local start_index = index
                 index = index + 2
-                while index <= #sqltext and string.sub(sqltext, index, index) ~= "\\n" do
+                while index <= #canonical_sqltext and string.sub(canonical_sqltext, index, index) ~= "\\n" do
                     index = index + 1
                 end
-                if index <= #sqltext then
+                if index <= #canonical_sqltext then
                     index = index + 1
                 end
-                tokens[#tokens + 1] = {type = "comment", text = string.sub(sqltext, start_index, index - 1)}
+                tokens[#tokens + 1] = {type = "comment", text = string.sub(canonical_sqltext, start_index, index - 1)}
             elseif ch == "/" and next_ch == "*" then
                 local start_index = index
                 index = index + 2
-                while index <= #sqltext - 1 and string.sub(sqltext, index, index + 1) ~= "*/" do
+                while index <= #canonical_sqltext - 1 and string.sub(canonical_sqltext, index, index + 1) ~= "*/" do
                     index = index + 1
                 end
-                if index <= #sqltext - 1 then
+                if index <= #canonical_sqltext - 1 then
                     index = index + 2
                 end
-                tokens[#tokens + 1] = {type = "comment", text = string.sub(sqltext, start_index, index - 1)}
+                tokens[#tokens + 1] = {type = "comment", text = string.sub(canonical_sqltext, start_index, index - 1)}
             elseif ch == "'" then
                 local start_index = index
                 index = index + 1
-                while index <= #sqltext do
-                    local current = string.sub(sqltext, index, index)
+                while index <= #canonical_sqltext do
+                    local current = string.sub(canonical_sqltext, index, index)
                     if current == "'" then
-                        if string.sub(sqltext, index + 1, index + 1) == "'" then
+                        if string.sub(canonical_sqltext, index + 1, index + 1) == "'" then
                             index = index + 2
                         else
                             index = index + 1
@@ -217,14 +270,14 @@ COMMON_LUA = """
                         index = index + 1
                     end
                 end
-                tokens[#tokens + 1] = {type = "string", text = string.sub(sqltext, start_index, index - 1)}
+                tokens[#tokens + 1] = {type = "string", text = string.sub(canonical_sqltext, start_index, index - 1)}
             elseif ch == '"' then
                 local start_index = index
                 index = index + 1
-                while index <= #sqltext do
-                    local current = string.sub(sqltext, index, index)
+                while index <= #canonical_sqltext do
+                    local current = string.sub(canonical_sqltext, index, index)
                     if current == '"' then
-                        if string.sub(sqltext, index + 1, index + 1) == '"' then
+                        if string.sub(canonical_sqltext, index + 1, index + 1) == '"' then
                             index = index + 2
                         else
                             index = index + 1
@@ -234,7 +287,7 @@ COMMON_LUA = """
                         index = index + 1
                     end
                 end
-                local token_text = string.sub(sqltext, start_index, index - 1)
+                local token_text = string.sub(canonical_sqltext, start_index, index - 1)
                 tokens[#tokens + 1] = {
                     type = "quoted_identifier",
                     text = token_text,
@@ -243,19 +296,19 @@ COMMON_LUA = """
             elseif string.match(ch, "[A-Za-z_]") then
                 local start_index = index
                 index = index + 1
-                while index <= #sqltext and string.match(string.sub(sqltext, index, index), "[A-Za-z0-9_]") do
+                while index <= #canonical_sqltext and string.match(string.sub(canonical_sqltext, index, index), "[A-Za-z0-9_]") do
                     index = index + 1
                 end
-                tokens[#tokens + 1] = {type = "word", text = string.sub(sqltext, start_index, index - 1)}
+                tokens[#tokens + 1] = {type = "word", text = string.sub(canonical_sqltext, start_index, index - 1)}
             elseif string.match(ch, "%d") then
                 local start_index = index
                 index = index + 1
-                while index <= #sqltext and string.match(string.sub(sqltext, index, index), "[0-9]") do
+                while index <= #canonical_sqltext and string.match(string.sub(canonical_sqltext, index, index), "[0-9]") do
                     index = index + 1
                 end
-                tokens[#tokens + 1] = {type = "number", text = string.sub(sqltext, start_index, index - 1)}
+                tokens[#tokens + 1] = {type = "number", text = string.sub(canonical_sqltext, start_index, index - 1)}
             else
-                local two_chars = string.sub(sqltext, index, index + 1)
+                local two_chars = string.sub(canonical_sqltext, index, index + 1)
                 if two_chars == ">=" or two_chars == "<=" or two_chars == "<>" or two_chars == "!="
                         or two_chars == "||" then
                     tokens[#tokens + 1] = {type = "punct", text = two_chars}
@@ -352,6 +405,24 @@ COMMON_LUA = """
         return current
     end
 
+    local function find_matching_raw_paren(tokens, opening_index)
+        local depth = 0
+        local index = opening_index
+        while index <= #tokens do
+            local token = tokens[index]
+            if token == "(" then
+                depth = depth + 1
+            elseif token == ")" then
+                depth = depth - 1
+                if depth == 0 then
+                    return index
+                end
+            end
+            index = index + 1
+        end
+        return nil
+    end
+
     local is_clause_keyword
     local is_join_keyword
 
@@ -399,17 +470,33 @@ COMMON_LUA = """
                 local normalized = normalize(token)
                 if normalized == "FROM" or normalized == "JOIN" then
                     local table_index = next_significant_raw(tokens, index + 1)
-                    local table_parts = parse_identifier_token(tokens[table_index])
-                    if table_parts ~= nil then
-                        local alias_name, alias_end_index = read_alias_after_table(tokens, table_index)
-                        out[#out + 1] = {
-                            catalog_name = (#table_parts >= 3) and table_parts[#table_parts - 2] or nil,
-                            schema_name = (#table_parts >= 2) and table_parts[#table_parts - 1] or nil,
-                            table_name = table_parts[#table_parts],
-                            alias_name = alias_name,
-                            insert_after_index = alias_end_index
-                        }
-                        index = alias_end_index
+                    if table_index <= #tokens and tokens[table_index] == "(" then
+                        local closing_index = find_matching_raw_paren(tokens, table_index)
+                        if closing_index ~= nil then
+                            local alias_name, alias_end_index = read_alias_after_table(tokens, closing_index)
+                            if alias_name ~= nil then
+                                out[#out + 1] = {
+                                    table_name = alias_name,
+                                    alias_name = alias_name,
+                                    kind = "derived_source",
+                                    insert_after_index = alias_end_index
+                                }
+                                index = alias_end_index
+                            end
+                        end
+                    else
+                        local table_parts = parse_identifier_token(tokens[table_index])
+                        if table_parts ~= nil then
+                            local alias_name, alias_end_index = read_alias_after_table(tokens, table_index)
+                            out[#out + 1] = {
+                                catalog_name = (#table_parts >= 3) and table_parts[#table_parts - 2] or nil,
+                                schema_name = (#table_parts >= 2) and table_parts[#table_parts - 1] or nil,
+                                table_name = table_parts[#table_parts],
+                                alias_name = alias_name,
+                                insert_after_index = alias_end_index
+                            }
+                            index = alias_end_index
+                        end
                     end
                 end
             end
@@ -535,7 +622,7 @@ COMMON_LUA = """
             return token.text == "," or token.text == ")"
         end
         local normalized = normalize_path_token(token)
-        return normalized ~= nil and (CLAUSE_KEYWORDS[normalized] == true or normalized == "JOIN" or normalized == "LEFT"
+        return normalized ~= nil and (CLAUSE_KEYWORDS[normalized] == true or normalized == "FROM" or normalized == "JOIN" or normalized == "LEFT"
                 or normalized == "RIGHT" or normalized == "FULL" or normalized == "INNER"
                 or normalized == "CROSS")
     end
@@ -821,6 +908,77 @@ JOIN_MODE_LUA = """
         return string.upper(selector.kind)
     end
 
+    local function lookup_path_group_config_for_binding(binding, table_name, visible_name)
+        if binding == nil or table_name == nil or visible_name == nil then
+            return nil
+        end
+        local schema_name = binding.helper_schema_name
+                or helper_schema_name_for_table_reference(binding)
+                or binding.schema_name
+        local schema_tables = GROUP_CONFIG_BY_SCHEMA_AND_TABLE[normalize_identifier_value(schema_name)]
+        if schema_tables == nil then
+            return nil
+        end
+        local table_groups = schema_tables[normalize_identifier_value(table_name)]
+        if table_groups == nil then
+            return nil
+        end
+        local normalized_visible_name = normalize_identifier_value(visible_name)
+        local group_config = table_groups[normalized_visible_name]
+        if group_config ~= nil then
+            return group_config
+        end
+        return table_groups[normalize_identifier_value(visible_name .. "|array")]
+    end
+
+    local function group_reference_column_name(group_config)
+        if group_config == nil then
+            return nil
+        end
+        return group_config.referenceColumnName
+    end
+
+    table_has_visible_column = function(binding, table_name, column_name)
+        if binding == nil or table_name == nil or column_name == nil then
+            return false
+        end
+        local schema_name = binding.helper_schema_name
+                or helper_schema_name_for_table_reference(binding)
+                or binding.schema_name
+        local schema_tables = VISIBLE_COLUMNS_BY_SCHEMA_AND_TABLE[normalize_identifier_value(schema_name)]
+        local table_columns = schema_tables and schema_tables[normalize_identifier_value(table_name)] or nil
+        return table_columns ~= nil and table_columns[normalize_identifier_value(column_name)] == true
+    end
+
+    resolve_visible_path_column_name = function(binding, table_name, step_name)
+        local group_config = lookup_path_group_config_for_binding(binding, table_name, step_name)
+        local reference_column_name = group_reference_column_name(group_config)
+        if reference_column_name ~= nil then
+            return reference_column_name
+        end
+        if table_has_visible_column(binding, table_name, step_name) then
+            return step_name
+        end
+        if table_has_visible_column(binding, table_name, step_name .. "|object") then
+            return step_name .. "|object"
+        end
+        if table_has_visible_column(binding, table_name, step_name .. "|array") then
+            return step_name .. "|array"
+        end
+        return nil
+    end
+
+    local function resolve_value_member_column_name(binding, table_name)
+        local value_column_name = resolve_visible_path_column_name(binding, table_name, "value")
+        if value_column_name ~= nil then
+            return value_column_name
+        end
+        if table_has_visible_column(binding, table_name, "_value") then
+            return "_value"
+        end
+        return nil
+    end
+
     local function build_array_selector_sql(binding, current_table_name, selector_ref, array_ref, step, array_column_name, path)
         array_column_name = array_column_name or (step.name .. "|array")
         if step.selector.kind == "index" then
@@ -860,49 +1018,35 @@ JOIN_MODE_LUA = """
                     'Array selector "' .. step.selector.field_name .. '" must be ?, PARAM, or a visible field on the current row.'
                 )
             end
-            return selector_ref .. "." .. encode_quoted_identifier(step.selector.field_name)
+            local actual_field_name = resolve_visible_path_column_name(binding, current_table_name, step.selector.field_name)
+                    or step.selector.field_name
+            return selector_ref .. "." .. encode_quoted_identifier(actual_field_name)
         end
         return nil
     end
 
-    local function lookup_path_group_config_for_binding(binding, table_name, visible_name)
-        if binding == nil or table_name == nil or visible_name == nil then
-            return nil
+    local function raise_missing_path_field_error(path, step_name, parent_path)
+        local location = " on the current row source"
+        if parent_path ~= nil and parent_path ~= "" then
+            location = ' on object path "' .. parent_path .. '"'
         end
-        local schema_name = binding.helper_schema_name
-                or helper_schema_name_for_table_reference(binding)
-                or binding.schema_name
-        local schema_tables = GROUP_CONFIG_BY_SCHEMA_AND_TABLE[normalize_identifier_value(schema_name)]
-        if schema_tables == nil then
-            return nil
-        end
-        local table_groups = schema_tables[normalize_identifier_value(table_name)]
-        if table_groups == nil then
-            return nil
-        end
-        local normalized_visible_name = normalize_identifier_value(visible_name)
-        local group_config = table_groups[normalized_visible_name]
-        if group_config ~= nil then
-            return group_config
-        end
-        return table_groups[normalize_identifier_value(visible_name .. "|array")]
+        raise_path_error(
+            path,
+            'Field "' .. step_name .. '" is not visible' .. location
+                    .. '. Use describe wrapper --json to inspect nested fields.'
+        )
     end
 
-    local function table_has_visible_column(binding, table_name, column_name)
-        if binding == nil or table_name == nil or column_name == nil then
-            return false
-        end
-        local schema_name = binding.helper_schema_name
-                or helper_schema_name_for_table_reference(binding)
-                or binding.schema_name
-        local schema_tables = VISIBLE_COLUMNS_BY_SCHEMA_AND_TABLE[normalize_identifier_value(schema_name)]
-        local table_columns = schema_tables and schema_tables[normalize_identifier_value(table_name)] or nil
-        return table_columns ~= nil and table_columns[normalize_identifier_value(column_name)] == true
-    end
-
-    local function ensure_property_step_can_navigate(path, binding, current_table_name, step_name)
+    local function ensure_property_step_can_navigate(path, binding, current_table_name, step_name, parent_path)
         local group_config = lookup_path_group_config_for_binding(binding, current_table_name, step_name)
+        local visible_column_name = resolve_visible_path_column_name(binding, current_table_name, step_name)
         local variant_columns = group_config and group_config.variantColumns or nil
+        if variant_columns ~= nil and variant_columns["OBJECT"] ~= nil then
+            return
+        end
+        if visible_column_name == (step_name .. "|object") then
+            return
+        end
         if variant_columns ~= nil and variant_columns["ARRAY"] ~= nil and variant_columns["OBJECT"] == nil then
             raise_path_error(
                 path,
@@ -911,6 +1055,55 @@ JOIN_MODE_LUA = """
                         .. step_name .. '[index]" for a single element.'
             )
         end
+        if visible_column_name == (step_name .. "|array") then
+            raise_path_error(
+                path,
+                'Path step "' .. step_name .. '" resolves to an array. '
+                        .. 'Use JOIN ... IN row."' .. step_name .. '" for traversal or "'
+                        .. step_name .. '[index]" for a single element.'
+            )
+        end
+        if visible_column_name ~= nil or group_config ~= nil then
+            raise_path_error(
+                path,
+                'Path step "' .. step_name .. '" resolves to a scalar value. '
+                        .. 'Only object fields can be followed by another dot-path segment.'
+            )
+        end
+        raise_missing_path_field_error(path, step_name, parent_path)
+    end
+
+    local function ensure_array_step_can_access(path, binding, current_table_name, step_name, parent_path)
+        local group_config = lookup_path_group_config_for_binding(binding, current_table_name, step_name)
+        local visible_column_name = resolve_visible_path_column_name(binding, current_table_name, step_name)
+        local variant_columns = group_config and group_config.variantColumns or nil
+        if variant_columns ~= nil and variant_columns["ARRAY"] ~= nil then
+            return
+        end
+        if visible_column_name == (step_name .. "|array") then
+            return
+        end
+        if variant_columns ~= nil and variant_columns["OBJECT"] ~= nil and variant_columns["ARRAY"] == nil then
+            raise_path_error(
+                path,
+                'Path step "' .. step_name .. '" resolves to an object. '
+                        .. 'Use dotted navigation such as "' .. step_name .. '.field" instead of brackets.'
+            )
+        end
+        if visible_column_name == (step_name .. "|object") then
+            raise_path_error(
+                path,
+                'Path step "' .. step_name .. '" resolves to an object. '
+                        .. 'Use dotted navigation such as "' .. step_name .. '.field" instead of brackets.'
+            )
+        end
+        if visible_column_name ~= nil or group_config ~= nil then
+            raise_path_error(
+                path,
+                'Bracket selectors require an array field. "' .. step_name .. '" is not an array on this row source.'
+            )
+        end
+        raise_missing_path_field_error(path, step_name, parent_path)
     end
 
     local function add_path_projection_column(column_names, seen_columns, column_name)
@@ -1306,10 +1499,28 @@ JOIN_MODE_LUA = """
                         .. "|" .. table.concat(prefix, ".")
 
                 if step.type == "property" then
+                    local parent_path = nil
+                    if #prefix > 1 then
+                        parent_path = table.concat(prefix, ".", 1, #prefix - 1)
+                    end
                     if is_last then
-                        replacement = current_ref .. "." .. encode_quoted_identifier(step.name)
+                        local visible_column_name = resolve_visible_path_column_name(
+                                binding,
+                                current_table_name,
+                                step.name
+                        )
+                        if visible_column_name == nil then
+                            raise_missing_path_field_error(reference.path, step.name, parent_path)
+                        end
+                        replacement = current_ref .. "." .. encode_quoted_identifier(visible_column_name)
                     else
-                        ensure_property_step_can_navigate(reference.path, binding, current_table_name, step.name)
+                        ensure_property_step_can_navigate(
+                            reference.path,
+                            binding,
+                            current_table_name,
+                            step.name,
+                            parent_path
+                        )
                         local existing = join_aliases[prefix_key]
                         local child_table_name = derive_child_table_name_for_iterator(current_table_name, step.name)
                         local step_source_ref, step_object_column_name = resolve_object_step_source(
@@ -1343,6 +1554,11 @@ JOIN_MODE_LUA = """
                         current_table_name = existing.table_name
                     end
                 elseif step.type == "array" then
+                    local parent_path = nil
+                    if #prefix > 1 then
+                        parent_path = table.concat(prefix, ".", 1, #prefix - 1)
+                    end
+                    ensure_array_step_can_access(reference.path, binding, current_table_name, step.name, parent_path)
                     local array_source_ref, array_column_name = resolve_array_step_source(
                             binding,
                             current_ref,
@@ -1395,14 +1611,15 @@ JOIN_MODE_LUA = """
                         current_row_id = current_ref .. "." .. encode_quoted_identifier("_id")
                         current_table_name = existing.table_name
                         if is_last then
-                            if not table_has_visible_column(binding, current_table_name, "_value") then
+                            local value_column_name = resolve_value_member_column_name(binding, current_table_name)
+                            if value_column_name == nil then
                                 raise_path_error(
                                     reference.path,
                                     'Bracket access on object-array elements requires a trailing property, '
                                             .. 'for example "items[LAST].value", or a nested JOIN ... IN.'
                                 )
                             end
-                            replacement = current_ref .. "." .. encode_quoted_identifier("_value")
+                            replacement = current_ref .. "." .. encode_quoted_identifier(value_column_name)
                         end
                     end
                 end
@@ -1492,10 +1709,28 @@ JOIN_MODE_LUA = """
                     prefix[#prefix + 1] = serialize_step(step)
                     local prefix_key = table.concat(prefix, ".")
                     if step.type == "property" then
+                        local parent_path = nil
+                        if #prefix > 1 then
+                            parent_path = table.concat(prefix, ".", 1, #prefix - 1)
+                        end
                         if is_last then
-                            replacement = current_ref .. "." .. encode_quoted_identifier(step.name)
+                            local visible_column_name = resolve_visible_path_column_name(
+                                    base_table,
+                                    current_table_name,
+                                    step.name
+                            )
+                            if visible_column_name == nil then
+                                raise_missing_path_field_error(reference.path, step.name, parent_path)
+                            end
+                            replacement = current_ref .. "." .. encode_quoted_identifier(visible_column_name)
                         else
-                            ensure_property_step_can_navigate(reference.path, base_table, current_table_name, step.name)
+                            ensure_property_step_can_navigate(
+                                reference.path,
+                                base_table,
+                                current_table_name,
+                                step.name,
+                                parent_path
+                            )
                             local existing = join_aliases[prefix_key]
                             local child_table_name = derive_child_table_name(current_table_name, step.name)
                             local step_source_ref, step_object_column_name = resolve_object_step_source(
@@ -1525,6 +1760,11 @@ JOIN_MODE_LUA = """
                             current_table_name = existing.table_name
                         end
                     elseif step.type == "array" then
+                        local parent_path = nil
+                        if #prefix > 1 then
+                            parent_path = table.concat(prefix, ".", 1, #prefix - 1)
+                        end
+                        ensure_array_step_can_access(reference.path, base_table, current_table_name, step.name, parent_path)
                         local array_source_ref, array_column_name = resolve_array_step_source(
                                 base_table,
                                 current_ref,
@@ -1573,14 +1813,15 @@ JOIN_MODE_LUA = """
                             current_row_id = current_ref .. "." .. encode_quoted_identifier("_id")
                             current_table_name = existing.table_name
                             if is_last then
-                                if not table_has_visible_column(base_table, current_table_name, "_value") then
+                                local value_column_name = resolve_value_member_column_name(base_table, current_table_name)
+                                if value_column_name == nil then
                                     raise_path_error(
                                         reference.path,
                                         'Bracket access on object-array elements requires a trailing property, '
                                                 .. 'for example "items[LAST].value", or a nested JOIN ... IN.'
                                     )
                                 end
-                                replacement = current_ref .. "." .. encode_quoted_identifier("_value")
+                                replacement = current_ref .. "." .. encode_quoted_identifier(value_column_name)
                             end
                         end
                     end
@@ -2078,15 +2319,16 @@ ARRAY_ITERATION_LUA = """
     end
 
     local function build_iterator_binding(iterator_source, root_binding, array_child_table_name)
+        local iterator_schema_name = root_binding.helper_schema_name or root_binding.schema_name
         return {
             alias_name = iterator_source.alias_name,
             reference_sql = iterator_source.reference_sql,
             kind = iterator_source.is_value and "iterator_value" or "iterator_row",
             table_name = array_child_table_name,
-            schema_name = root_binding.schema_name,
+            schema_name = iterator_schema_name,
             catalog_name = root_binding.catalog_name,
             has_row_id = not iterator_source.is_value,
-            helper_schema_name = root_binding.helper_schema_name
+            helper_schema_name = iterator_schema_name
         }
     end
 
@@ -2372,6 +2614,26 @@ ARRAY_ITERATION_LUA = """
         return table.concat(pending_filters, " AND ")
     end
 
+    local table_has_visible_column
+    local resolve_visible_path_column_name
+
+    local function resolve_iterator_member_column_name(binding, member_name)
+        if binding == nil or member_name == nil then
+            return nil
+        end
+        if normalize_identifier_value(member_name) == "_INDEX" then
+            return "_index"
+        end
+        local actual_member_name = resolve_visible_path_column_name(binding, binding.table_name, member_name)
+        if actual_member_name ~= nil then
+            return actual_member_name
+        end
+        if table_has_visible_column(binding, binding.table_name, member_name) then
+            return member_name
+        end
+        return nil
+    end
+
     local function rewrite_iterator_index_references_in_sql(sqltext, scope)
         local tokens = tokenize_path_sql(sqltext)
         local out = {}
@@ -2401,11 +2663,17 @@ ARRAY_ITERATION_LUA = """
             end
             if binding ~= nil and (binding.kind == "iterator_row" or binding.kind == "iterator_value")
                     and dot_token ~= nil and dot_token.type == "punct" and dot_token.text == "."
-                    and member_token ~= nil and member_token.type == "word" then
-                out[#out + 1] = token.text
-                out[#out + 1] = "."
-                out[#out + 1] = encode_quoted_identifier(member_name)
-                index = member_index + 1
+                    and member_token ~= nil then
+                local rewritten_member_name = resolve_iterator_member_column_name(binding, member_name)
+                if rewritten_member_name ~= nil and (member_token.type == "word" or rewritten_member_name ~= member_name) then
+                    out[#out + 1] = token.text
+                    out[#out + 1] = "."
+                    out[#out + 1] = encode_quoted_identifier(rewritten_member_name)
+                    index = member_index + 1
+                else
+                    out[#out + 1] = token.text
+                    index = index + 1
+                end
             else
                 out[#out + 1] = token.text
                 index = index + 1
@@ -2414,7 +2682,9 @@ ARRAY_ITERATION_LUA = """
         return table.concat(out)
     end
 
-    local function rewrite_query_block_tokens(tokens, outer_scope)
+    local function rewrite_query_block_tokens(tokens, outer_scope, options)
+        options = options or {}
+        local recurse_parenthesized_query_blocks = options.recurse_parenthesized_query_blocks ~= false
         local scope = copy_scope(outer_scope or {})
         local out = {}
         local pending_filters = {}
@@ -2437,11 +2707,13 @@ ARRAY_ITERATION_LUA = """
             if token.type == "punct" and token.text == "(" then
                 local closing_index = find_matching_path_paren(tokens, index)
                 local first_inside, first_inside_index = next_significant_path_token(tokens, index + 1)
-                if closing_index ~= nil and first_inside_index ~= nil and path_token_is_query_start(first_inside) then
+                if recurse_parenthesized_query_blocks and closing_index ~= nil and first_inside_index ~= nil
+                        and path_token_is_query_start(first_inside) then
                     out[#out + 1] = "("
                     out[#out + 1] = rewrite_query_block_tokens(
                             {table.unpack(tokens, index + 1, closing_index - 1)},
-                            scope
+                            scope,
+                            options
                     )
                     out[#out + 1] = ")"
                     index = closing_index + 1
@@ -2487,6 +2759,18 @@ ARRAY_ITERATION_LUA = """
                         out[#out + 1] = encode_quoted_identifier("_index")
                         index = member_index + 1
                         goto continue
+                    elseif binding ~= nil and (binding.kind == "iterator_row" or binding.kind == "iterator_value")
+                            and dot_token ~= nil and dot_token.type == "punct" and dot_token.text == "."
+                            and member_token ~= nil then
+                        local rewritten_member_name = resolve_iterator_member_column_name(binding, member_name)
+                        if rewritten_member_name ~= nil
+                                and (member_token.type == "word" or rewritten_member_name ~= member_name) then
+                            out[#out + 1] = token.text
+                            out[#out + 1] = "."
+                            out[#out + 1] = encode_quoted_identifier(rewritten_member_name)
+                            index = member_index + 1
+                            goto continue
+                        end
                     end
                 end
                 local prefix = read_join_prefix_at(tokens, index)
@@ -2557,6 +2841,20 @@ ARRAY_ITERATION_LUA = """
                     out[#out + 1] = "."
                     out[#out + 1] = encode_quoted_identifier("_index")
                     index = member_index + 1
+                elseif binding ~= nil and (binding.kind == "iterator_row" or binding.kind == "iterator_value")
+                        and dot_token ~= nil and dot_token.type == "punct" and dot_token.text == "."
+                        and member_token ~= nil then
+                    local rewritten_member_name = resolve_iterator_member_column_name(binding, member_name)
+                    if rewritten_member_name ~= nil
+                            and (member_token.type == "word" or rewritten_member_name ~= member_name) then
+                        out[#out + 1] = token.text
+                        out[#out + 1] = "."
+                        out[#out + 1] = encode_quoted_identifier(rewritten_member_name)
+                        index = member_index + 1
+                    else
+                        out[#out + 1] = token.text
+                        index = index + 1
+                    end
                 else
                     out[#out + 1] = token.text
                     index = index + 1
@@ -2574,13 +2872,13 @@ ARRAY_ITERATION_LUA = """
         return rewrite_iterator_index_references_in_sql(table.concat(out), scope)
     end
 
-    local function rewrite_array_iteration_query_sql(sqltext)
+    local function rewrite_array_iteration_query_sql(sqltext, options)
         local tokens = tokenize_path_sql(sqltext)
         local first_token = next_significant_path_token(tokens, 1)
         if first_token == nil or not path_token_is_query_start(first_token) then
             return sqltext
         end
-        return rewrite_query_block_tokens(tokens, {})
+        return rewrite_query_block_tokens(tokens, {}, options)
     end
 
     local function rewrite_array_iteration_in_sql(sqltext)
@@ -2815,6 +3113,16 @@ WRAPPER_EXPLICIT_NULL_HELPER_LUA = """
                 return 'TO_JSON subset arguments must be visible top-level properties. Nested paths such as "meta.info.note" and bracket expressions such as "tags[SIZE]" are not supported.'
             end
         end
+        local _, qualifier_quote_start = string.find(raw, '%.%s*"', 1)
+        if qualifier_quote_start ~= nil then
+            local tail = trim_sql_argument_text(string.sub(raw, qualifier_quote_start))
+            if string.sub(tail, 1, 1) == '"' and string.sub(tail, -1, -1) == '"' then
+                local decoded_tail = decode_quoted_identifier(tail)
+                if string.find(decoded_tail, ".", 1, true) ~= nil or string.find(decoded_tail, "[", 1, true) ~= nil then
+                    return 'TO_JSON subset arguments must be visible top-level properties. Nested paths such as "meta.info.note" and bracket expressions such as "tags[SIZE]" are not supported.'
+                end
+            end
+        end
         return nil
     end
 
@@ -2847,8 +3155,9 @@ WRAPPER_EXPLICIT_NULL_HELPER_LUA = """
             elseif depth == 0 then
                 local prefix = read_join_prefix_at(tokens, index)
                 if prefix ~= nil then
-                    local binding, _ = read_standard_source_binding(tokens, prefix.end_index + 1)
+                    local binding, insert_after_index = read_standard_source_binding(tokens, prefix.end_index + 1)
                     if binding ~= nil then
+                        binding.insert_after_index = insert_after_index
                         local alias_key = normalize_identifier_value(binding.alias_name or binding.table_name)
                         if alias_key ~= nil then
                             lookup[alias_key] = binding
@@ -3327,6 +3636,11 @@ ORDER BY COLUMN_ORDINAL_POSITION
         if column_names == nil or #column_names == 0 then
             raise_function_error("TO_JSON", "Internal error: missing export projection columns.")
         end
+        local row_key_column = root_config.rowKeyColumn
+        local row_key_source_columns = root_config.rowKeySourceColumns or {}
+        if row_key_column == nil or row_key_column == "" or #row_key_source_columns == 0 then
+            raise_function_error("TO_JSON", "Internal error: missing export row-key metadata.")
+        end
 
         local join_key = normalize_identifier_value(table_reference.alias_name or table_reference.table_name)
                 .. "|" .. normalize_identifier_value(root_config.exportViewQualified)
@@ -3342,11 +3656,11 @@ ORDER BY COLUMN_ORDINAL_POSITION
         to_json_state.next_alias_id = to_json_state.next_alias_id + 1
         local alias_ref = encode_quoted_identifier(alias_name)
         local projected_alias_by_name = {}
-        local row_id_alias = "__jvs_row_id"
+        local row_key_alias = "__jvs_row_key"
         local helper_reference = build_helper_reference(alias_ref, projected_alias_by_name)
         to_json_state.alias_by_key[join_key] = helper_reference
         local projected_columns = {
-            encode_quoted_identifier(root_config.idColumn) .. " AS " .. encode_quoted_identifier(row_id_alias)
+            encode_quoted_identifier(row_key_column) .. " AS " .. encode_quoted_identifier(row_key_alias)
         }
         for column_index, column_name in ipairs(column_names) do
             local projected_alias = "__jvs_col_" .. tostring(column_index)
@@ -3354,14 +3668,22 @@ ORDER BY COLUMN_ORDINAL_POSITION
             projected_columns[#projected_columns + 1] = encode_quoted_identifier(column_name)
                     .. " AS " .. encode_quoted_identifier(projected_alias)
         end
+        local row_key_expr_parts = {}
+        for _, source_column_name in ipairs(row_key_source_columns) do
+            row_key_expr_parts[#row_key_expr_parts + 1] =
+                    encode_string_literal(source_column_name .. "=")
+                    .. " || CAST("
+                    .. table_reference_sql(table_reference) .. "." .. encode_quoted_identifier(source_column_name)
+                    .. " AS VARCHAR(2000000))"
+        end
+        local row_key_expr = table.concat(row_key_expr_parts, " || '|' || ")
         add_join_insertion(
             to_json_state.join_insertions,
             table_reference.insert_after_index,
             " LEFT OUTER JOIN (SELECT " .. table.concat(projected_columns, ", ")
                     .. " FROM " .. root_config.exportViewQualified .. ") " .. alias_ref
-                    .. " ON (" .. table_reference_sql(table_reference) .. "."
-                    .. encode_quoted_identifier(root_config.idColumn) .. " = "
-                    .. alias_ref .. "." .. encode_quoted_identifier(row_id_alias) .. ")"
+                    .. " ON (" .. row_key_expr .. " = "
+                    .. alias_ref .. "." .. encode_quoted_identifier(row_key_alias) .. ")"
         )
         return helper_reference
     end
@@ -3446,12 +3768,6 @@ ORDER BY COLUMN_ORDINAL_POSITION
                     'TO_JSON is not supported on VALUE iterators yet. Use plain SQL on the scalar iterator value instead.'
                 )
             end
-            if base_table.kind == "iterator_row" then
-                raise_function_error(
-                    function_name,
-                    'TO_JSON is not supported on iterator-row aliases yet. Use the wrapper root row instead.'
-                )
-            end
             return base_table
         end
 
@@ -3479,12 +3795,6 @@ ORDER BY COLUMN_ORDINAL_POSITION
             raise_function_error(
                 function_name,
                 'TO_JSON is not supported on VALUE iterators yet. Use plain SQL on the scalar iterator value instead.'
-            )
-        end
-        if table_reference.kind == "iterator_row" then
-            raise_function_error(
-                function_name,
-                'TO_JSON is not supported on iterator-row aliases yet. Use the wrapper root row instead.'
             )
         end
         return table_reference
@@ -3545,12 +3855,6 @@ ORDER BY COLUMN_ORDINAL_POSITION
                     'TO_JSON is not supported on VALUE iterators yet. Use plain SQL on the scalar iterator value instead.'
                 )
             end
-            if base_table.kind == "iterator_row" then
-                raise_function_error(
-                    function_name,
-                    'TO_JSON is not supported on iterator-row aliases yet. Use the wrapper root row instead.'
-                )
-            end
             table_reference = base_table
         elseif #identifier_parts == 2 then
             local qualifier_name = identifier_parts[1]
@@ -3580,16 +3884,10 @@ ORDER BY COLUMN_ORDINAL_POSITION
                     'TO_JSON is not supported on VALUE iterators yet. Use plain SQL on the scalar iterator value instead.'
                 )
             end
-            if table_reference.kind == "iterator_row" then
-                raise_function_error(
-                    function_name,
-                    'TO_JSON is not supported on iterator-row aliases yet. Use the wrapper root row instead.'
-                )
-            end
         else
             raise_function_error(
                 function_name,
-                'TO_JSON subset arguments must be top-level property references, optionally qualified as root_alias."property".'
+                'TO_JSON subset arguments must be visible top-level properties. Nested paths such as "meta.info.note" and bracket expressions such as "tags[SIZE]" are not supported.'
             )
         end
 
@@ -3957,51 +4255,49 @@ def render_sql(
     blocked_function_message: str,
     allowed_schemas: list[str],
     helper_schema_map: dict[str, str],
-    wrapper_group_config: dict[str, dict[str, dict[str, object]]] | None,
-    wrapper_visible_column_config: dict[str, dict[str, dict[str, bool]]] | None,
-    wrapper_to_json_config: dict[str, dict[str, dict[str, object]]] | None,
+    wrapper_group_config: WrapperGroupConfig | None,
+    wrapper_visible_column_config: WrapperVisibleColumnConfig | None,
+    wrapper_to_json_config: WrapperToJsonConfig | None,
     regular_to_json_row_object_function: str | None,
     rewrite_path_identifiers: bool,
     activate_session: bool,
     helper_function_kinds: dict[str, str] | None = None,
+    library_script: str = DEFAULT_PREPROCESSOR_LIBRARY_SCRIPT,
 ) -> str:
+    validated_library_script = validate_identifier("Library script", library_script)
     helper_function_kinds = helper_function_kinds or {name: "explicit_null" for name in function_names}
     configured_function_names = list(helper_function_kinds.keys())
-    helper_kind_map_lua = render_lua_string_table(helper_function_kinds, 4)
     function_list_sql = ", ".join(configured_function_names) if configured_function_names else "(disabled)"
-    blocked_function_rows = "\n".join(f"        {name} = true," for name in blocked_function_names)
-    blocked_function_set_lua = "{\n" + blocked_function_rows + "\n    }"
     blocked_function_list_sql = ", ".join(blocked_function_names) if blocked_function_names else "(none)"
-    allowed_schema_rows = "\n".join(f"        {name} = true," for name in allowed_schemas)
-    allowed_schema_set_lua = "{\n" + allowed_schema_rows + "\n    }"
     allowed_schema_list_sql = ", ".join(allowed_schemas)
     example_allowed_schema = allowed_schemas[0] if allowed_schemas else "JSON_VIEW"
-    helper_schema_rows = "\n".join(
-        f"        {public_schema} = {helper_schema!r},"
-        for public_schema, helper_schema in sorted(helper_schema_map.items())
-    )
-    helper_schema_map_lua = "{\n" + helper_schema_rows + "\n    }" if helper_schema_rows else "{}"
     helper_schema_comment = (
         ", ".join(f"{public_schema}->{helper_schema}" for public_schema, helper_schema in sorted(helper_schema_map.items()))
         if helper_schema_map
         else "(none)"
     )
-    wrapper_group_config_lua = render_lua_string_table(wrapper_group_config or {}, 4)
-    wrapper_visible_columns_lua = render_lua_string_table(wrapper_visible_column_config or {}, 4)
-    wrapper_to_json_config_lua = render_lua_string_table(wrapper_to_json_config or {}, 4)
-    regular_to_json_row_object_function_lua = lua_quote_string(regular_to_json_row_object_function or "")
+    config_lua = render_lua_string_table(
+        _build_preprocessor_config(
+            function_names=function_names,
+            blocked_function_names=blocked_function_names,
+            blocked_function_message=blocked_function_message,
+            allowed_schemas=allowed_schemas,
+            helper_schema_map=helper_schema_map,
+            wrapper_group_config=wrapper_group_config,
+            wrapper_visible_column_config=wrapper_visible_column_config,
+            wrapper_to_json_config=wrapper_to_json_config,
+            regular_to_json_row_object_function=regular_to_json_row_object_function,
+            rewrite_path_identifiers=rewrite_path_identifiers,
+            helper_function_kinds=helper_function_kinds,
+        ),
+        4,
+    )
     has_variant_helpers = any(kind != "explicit_null" for kind in helper_function_kinds.values())
     if wrapper_group_config:
         helper_mode = "wrapper semantic helpers" if has_variant_helpers else "wrapper explicit-null joins"
     else:
         helper_mode = "CASE-marker compatibility helpers"
-    if not rewrite_path_identifiers:
-        path_comment = "disabled"
-        path_lua = DISABLED_MODE_LUA
-    else:
-        path_comment = "enabled (joins)"
-        path_lua = JOIN_MODE_LUA
-    helper_rewrite_lua = WRAPPER_EXPLICIT_NULL_HELPER_LUA if wrapper_group_config else MARKER_HELPER_REWRITE_LUA
+    path_comment = "enabled (joins)" if rewrite_path_identifiers else "disabled"
 
     activation_sql = ""
     if activate_session:
@@ -4022,165 +4318,14 @@ def render_sql(
 -- Helper schema mappings: {helper_schema_comment}
 -- Helper rewrite mode: {helper_mode}
 -- Path identifier rewrite: {path_comment}
+-- Imported library script: {schema}.{validated_library_script}
 
 CREATE SCHEMA IF NOT EXISTS {schema};
 
 CREATE OR REPLACE LUA PREPROCESSOR SCRIPT {schema}.{script} AS
-    local HELPER_KIND_BY_NAME = {helper_kind_map_lua}
-    local BLOCKED_FUNCTIONS = {blocked_function_set_lua}
-    local BLOCKED_FUNCTION_MESSAGE = {blocked_function_message!r}
-    local ALLOWED_JSON_SCHEMAS = {allowed_schema_set_lua}
-    local ALLOWED_JSON_SCHEMA_LIST = {allowed_schema_list_sql!r}
-    local EXAMPLE_ALLOWED_SCHEMA = {example_allowed_schema!r}
-    local HELPER_SCHEMA_BY_ALLOWED_SCHEMA = {helper_schema_map_lua}
-    local GROUP_CONFIG_BY_SCHEMA_AND_TABLE = {wrapper_group_config_lua}
-    local VISIBLE_COLUMNS_BY_SCHEMA_AND_TABLE = {wrapper_visible_columns_lua}
-    local TO_JSON_CONFIG_BY_SCHEMA_AND_TABLE = {wrapper_to_json_config_lua}
-    local REGULAR_TO_JSON_ROW_OBJECT_FUNCTION = {regular_to_json_row_object_function_lua}
-
-    local function raise_function_error(function_name, message)
-        error("JVS-FUNCTION-ERROR: " .. function_name .. ": " .. message, 0)
-    end
-
-    local function raise_scope_error(feature_name, message)
-        error(
-            "JVS-SCOPE-ERROR: " .. feature_name
-                .. " is only available for configured JSON schemas ("
-                .. ALLOWED_JSON_SCHEMA_LIST .. "). "
-                .. message,
-            0
-        )
-    end
-
-    local function json_schema_scope_example()
-        return 'Qualify the JSON table in FROM/JOIN using one of the configured JSON schemas, '
-                .. 'for example FROM "' .. EXAMPLE_ALLOWED_SCHEMA .. '"."<ROOT_TABLE>".'
-    end
-
-    local function normalize(token)
-        return sqlparsing.normalize(token)
-    end
-
-    local function is_ignored(token)
-        return sqlparsing.iswhitespaceorcomment(token)
-    end
-{COMMON_LUA}
-{ARRAY_ITERATION_LUA}
-{path_lua}
-
-    local function next_significant(tokens, index)
-        local current = index
-        while current <= #tokens and is_ignored(tokens[current]) do
-            current = current + 1
-        end
-        return current
-    end
-
-    local function read_call(tokens, start_index)
-        local identifier_index = next_significant(tokens, start_index)
-        if identifier_index > #tokens then
-            return nil
-        end
-
-        local current = identifier_index
-        local identifier_parts = parse_identifier_token(tokens[current])
-        if identifier_parts == nil then
-            return nil
-        end
-
-        local last_identifier = normalize(identifier_parts[#identifier_parts])
-        if last_identifier == nil then
-            return nil
-        end
-
-        while true do
-            local dot_index = next_significant(tokens, current + 1)
-            if dot_index > #tokens or tokens[dot_index] ~= "." then
-                break
-            end
-            local next_identifier = next_significant(tokens, dot_index + 1)
-            if next_identifier > #tokens then
-                return nil
-            end
-            current = next_identifier
-            local next_identifier_parts = parse_identifier_token(tokens[current])
-            if next_identifier_parts == nil then
-                return nil
-            end
-            last_identifier = normalize(next_identifier_parts[#next_identifier_parts])
-            if last_identifier == nil then
-                return nil
-            end
-        end
-
-        local opening_paren = next_significant(tokens, current + 1)
-        if opening_paren > #tokens or tokens[opening_paren] ~= "(" then
-            return nil
-        end
-
-        return {{
-            last_identifier = last_identifier,
-            opening_paren = opening_paren
-        }}
-    end
-
-    local function find_matching_paren(tokens, opening_paren)
-        local depth = 1
-        local top_level_commas = 0
-        local index = opening_paren + 1
-        while index <= #tokens do
-            if not is_ignored(tokens[index]) then
-                if tokens[index] == "(" then
-                    depth = depth + 1
-                elseif tokens[index] == ")" then
-                    depth = depth - 1
-                    if depth == 0 then
-                        return index, top_level_commas
-                    end
-                elseif tokens[index] == "," and depth == 1 then
-                    top_level_commas = top_level_commas + 1
-                end
-            end
-            index = index + 1
-        end
-        return nil, nil
-    end
-
-    local function has_expression_argument(tokens, opening_paren, closing_paren)
-        for index = opening_paren + 1, closing_paren - 1 do
-            if not is_ignored(tokens[index]) then
-                return true
-            end
-        end
-        return false
-    end
-
-    local function helper_query_targets_allowed_schema(sqltext)
-        local path_tokens = tokenize_path_sql(sqltext)
-        local base_binding = read_base_source_binding_from_path_tokens(path_tokens)
-        if base_binding == nil then
-            return false, json_schema_scope_example()
-        end
-        if base_binding.kind == "derived_source" then
-            return false,
-                    'JSON helper functions do not resolve through derived tables yet. '
-                    .. 'Move the helper call into the inner SELECT or query the wrapper view directly.'
-        end
-        if base_binding.kind ~= "json_source" or not table_reference_is_in_allowed_schema(base_binding) then
-            return false, json_schema_scope_example()
-        end
-        return true, nil
-    end
-{helper_rewrite_lua}
-
-    local function rewrite(sqltext)
-        local rewritten_sql = rewrite_array_iteration_in_sql(sqltext)
-        rewritten_sql = rewrite_path_identifiers_in_sql(rewritten_sql)
-        rewritten_sql = rewrite_helper_calls_in_sql(rewritten_sql)
-        return rewritten_sql
-    end
-
-    sqlparsing.setsqltext(rewrite(sqlparsing.getsqltext()))
+    exa.import("{schema}.{validated_library_script}", "JVS_PREPROCESSOR_LIB")
+    local CONFIG = {config_lua}
+    sqlparsing.setsqltext(JVS_PREPROCESSOR_LIB.rewrite(sqlparsing.getsqltext(), CONFIG))
 /
 {activation_sql}
 

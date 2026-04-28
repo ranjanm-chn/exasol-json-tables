@@ -9,6 +9,7 @@ from pathlib import Path
 import _bootstrap  # noqa: F401
 
 from _fixture_expected_json import sample_fixture_documents
+from generate_json_export_views_sql import json_export_view_name
 from nano_support import ROOT, connect, install_source_fixture
 
 
@@ -87,9 +88,19 @@ def main() -> None:
         "package config TO_JSON helper profile",
     )
     assert_equal(
+        package_config["preprocessor"]["libraryScript"],
+        "JVS_PREPROCESSOR_LIB",
+        "package config preprocessor library script",
+    )
+    assert_equal(
         package_config["generatedFiles"]["viewsSql"],
         f"{PACKAGE_NAME}_views.sql",
         "package config relative views path",
+    )
+    assert_equal(
+        package_config["generatedFiles"]["preprocessorLibrarySql"],
+        f"{PACKAGE_NAME}_preprocessor_library.sql",
+        "package config relative preprocessor library path",
     )
 
     subprocess.run(
@@ -106,12 +117,19 @@ def main() -> None:
     )
 
     original_preprocessor_sql = (PACKAGE_DIR / package_config["generatedFiles"]["preprocessorSql"]).read_text()
+    original_preprocessor_library_sql = (
+        PACKAGE_DIR / package_config["generatedFiles"]["preprocessorLibrarySql"]
+    ).read_text()
     regenerated_preprocessor_sql = REGENERATED_PREPROCESSOR_PATH.read_text()
     assert_equal(
         regenerated_preprocessor_sql,
         original_preprocessor_sql,
         "targeted preprocessor regeneration",
     )
+    if "exa.import" not in original_preprocessor_sql:
+        raise AssertionError("generated wrapper preprocessor should import the shared preprocessor library")
+    if "function rewrite(sqltext, config)" not in original_preprocessor_library_sql:
+        raise AssertionError("generated preprocessor library should expose the shared rewrite entrypoint")
 
     install_result = subprocess.run(
         [
@@ -270,7 +288,9 @@ def main() -> None:
                 """
             ).fetchall()
         }
-        expected_helper_views = {"__JVS_JSON_EXPORT_SAMPLE", "__JVS_JSON_EXPORT_DEEPDOC"}
+        manifest_path = (PACKAGE_CONFIG_PATH.parent / package_config["generatedFiles"]["manifest"]).resolve()
+        manifest = json.loads(manifest_path.read_text())
+        expected_helper_views = {json_export_view_name(str(table["tableName"])) for table in manifest["tables"]}
         missing_helper_views = expected_helper_views - helper_view_names
         if missing_helper_views:
             raise AssertionError(f"installed package should materialize hidden export views; missing {sorted(missing_helper_views)}")

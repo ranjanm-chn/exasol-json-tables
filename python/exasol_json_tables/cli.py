@@ -10,6 +10,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict, cast
 from urllib.parse import parse_qsl, quote as url_quote, unquote, urlencode, urlparse, urlunparse
 
 from . import structured_result_tool
@@ -39,6 +40,165 @@ class CliCommandError(Exception):
 
     def __str__(self) -> str:
         return self.message
+
+
+class JsonErrorRepro(TypedDict):
+    argv: list[str]
+
+
+class JsonErrorEntry(TypedDict, total=False):
+    code: str
+    message: str
+    hint: str
+    repro: JsonErrorRepro
+    likelyFix: str
+
+
+class WrapperPreprocessorSummary(TypedDict, total=False):
+    schema: str
+    script: str
+    libraryScript: str | None
+    activationSql: str
+    activationRequired: bool
+
+
+class WrapperGeneratedFilesSummary(TypedDict):
+    manifest: str
+    viewsSql: str
+    preprocessorLibrarySql: str | None
+    preprocessorSql: str
+
+
+class WrapperResultFamilySummary(TypedDict):
+    kind: str
+    materializationConfig: str
+    materializedFamilyManifest: str
+
+
+class WrapperSummary(TypedDict, total=False):
+    packageConfig: str
+    sourceSchema: str
+    wrapperSchema: str
+    helperSchema: str
+    preprocessor: WrapperPreprocessorSummary
+    generatedFiles: WrapperGeneratedFilesSummary
+    warnings: list[str]
+    sourceManifest: str
+    resultFamily: WrapperResultFamilySummary
+    publicViews: list[str]
+    smokeTestSql: str
+
+
+class WrapperArtifactsPayload(TypedDict, total=False):
+    packageConfig: str
+    manifest: str
+    viewsSql: str
+    preprocessorLibrarySql: str | None
+    preprocessorSql: str
+    sourceManifest: str
+    resultFamilyConfig: str
+    resultFamilyManifest: str
+    output: str
+
+
+class WrapperObjectsPayload(TypedDict, total=False):
+    sourceSchema: str
+    wrapperSchema: str
+    helperSchema: str
+    preprocessorSchema: str
+    preprocessorScript: str
+    preprocessorLibraryScript: str | None
+    publicViews: list[str]
+
+
+class WrapperNextActionsPayload(TypedDict, total=False):
+    activationSql: str
+    activationRequired: bool
+    publicViews: list[str]
+    smokeTestSql: str
+
+
+class WrapperDiscoveryMetadata(TypedDict):
+    surfaceKind: str
+    discoveryMethod: str
+    autodiscoveredHelperSchema: bool
+    autodiscoveredWrapperSchema: bool
+    discoveryScope: str
+    publishedConsumerSurfacesIncluded: bool
+    wrapperSchema: str
+    helperSchema: str
+
+
+class ParsedExasolUrl(TypedDict):
+    dsn: str
+    user: str
+    password: str
+    schema: str | None
+    query: dict[str, str]
+
+
+class DerivedWorkflowNames(TypedDict):
+    sourceSchema: str
+    wrapperSchema: str
+    helperSchema: str
+    preprocessorSchema: str
+    preprocessorScript: str
+    packageName: str
+    artifactSubdir: str
+
+
+class IngestConnection(TypedDict):
+    dsn: str
+    user: str
+    password: str
+    sourceSchema: str
+    exasolUrl: str
+
+
+class Phase5WorkflowConfig(TypedDict):
+    workflowName: str
+    runArtifactDir: Path
+    sourceSchema: str
+    wrapperSchema: str
+    helperSchema: str
+    preprocessorSchema: str
+    preprocessorScript: str
+    packageName: str
+    dsn: str
+    user: str
+    password: str
+    exasolUrl: str
+
+
+class DeployReport(TypedDict):
+    validatedInstalled: bool
+    validation: dict[str, object] | None
+
+
+class InstalledWrapperEntry(TypedDict):
+    surfaceKind: str
+    discovery: WrapperDiscoveryMetadata
+    description: dict[str, object]
+    installedState: dict[str, object]
+
+
+class TopLevelFieldEntry(TypedDict):
+    name: str
+    kind: str
+
+
+class RelatedFieldEntry(TypedDict):
+    name: str
+    childTable: str
+
+
+class TableFieldSummary(TypedDict, total=False):
+    topLevelFields: list[TopLevelFieldEntry]
+    scalarFields: list[str]
+    objectFields: list[RelatedFieldEntry]
+    arrayFields: list[RelatedFieldEntry]
+    fieldTree: list[dict[str, object]]
+    familyTables: list[dict[str, object]]
 
 
 def _resolved(path: Path | None) -> Path | None:
@@ -119,13 +279,14 @@ def _wrapper_agent_warnings() -> list[str]:
     ]
 
 
-def _build_wrapper_summary_from_config_path(config_path: Path) -> dict[str, object]:
+def _build_wrapper_summary_from_config_path(config_path: Path) -> WrapperSummary:
     config_path = config_path.resolve()
     config = wrapper_package_tool.load_package_config(config_path)
     manifest_path = wrapper_package_tool.resolve_configured_path(
         config_path, config["generatedFiles"]["manifest"]
     ).resolve()
-    summary: dict[str, object] = {
+    preprocessor_library_sql_path = wrapper_package_tool.resolve_preprocessor_library_sql_path(config_path, config)
+    summary: WrapperSummary = {
         "packageConfig": str(config_path),
         "sourceSchema": config["sourceSchema"],
         "wrapperSchema": config["wrapperSchema"],
@@ -133,6 +294,7 @@ def _build_wrapper_summary_from_config_path(config_path: Path) -> dict[str, obje
         "preprocessor": {
             "schema": config["preprocessor"]["schema"],
             "script": config["preprocessor"]["script"],
+            "libraryScript": config["preprocessor"].get("libraryScript"),
             "activationSql": wrapper_package_tool.build_activation_sql(config, include_semicolon=True),
             "activationRequired": True,
         },
@@ -140,6 +302,11 @@ def _build_wrapper_summary_from_config_path(config_path: Path) -> dict[str, obje
             "manifest": str(manifest_path),
             "viewsSql": str(
                 wrapper_package_tool.resolve_configured_path(config_path, config["generatedFiles"]["viewsSql"]).resolve()
+            ),
+            "preprocessorLibrarySql": (
+                str(preprocessor_library_sql_path)
+                if preprocessor_library_sql_path is not None
+                else None
             ),
             "preprocessorSql": str(
                 wrapper_package_tool.resolve_configured_path(
@@ -167,16 +334,19 @@ def _build_wrapper_summary_from_config_path(config_path: Path) -> dict[str, obje
         }
     if manifest_path.exists():
         manifest = wrapper_package_tool.load_manifest_and_validate(config, manifest_path)
+        summary["publicViews"] = [str(root["publicView"]) for root in sorted(manifest["roots"], key=lambda item: item["publicView"])]
         summary["smokeTestSql"] = wrapper_package_tool.build_smoke_test_query(config, manifest)
     return summary
 
 
-def _build_wrapper_artifacts(summary: dict[str, object]) -> dict[str, object]:
-    artifacts: dict[str, object] = {
+def _build_wrapper_artifacts(summary: WrapperSummary) -> WrapperArtifactsPayload:
+    generated_files = summary["generatedFiles"]
+    artifacts: WrapperArtifactsPayload = {
         "packageConfig": summary["packageConfig"],
-        "manifest": summary["generatedFiles"]["manifest"],
-        "viewsSql": summary["generatedFiles"]["viewsSql"],
-        "preprocessorSql": summary["generatedFiles"]["preprocessorSql"],
+        "manifest": generated_files["manifest"],
+        "viewsSql": generated_files["viewsSql"],
+        "preprocessorLibrarySql": generated_files["preprocessorLibrarySql"],
+        "preprocessorSql": generated_files["preprocessorSql"],
     }
     if "sourceManifest" in summary:
         artifacts["sourceManifest"] = summary["sourceManifest"]
@@ -186,21 +356,29 @@ def _build_wrapper_artifacts(summary: dict[str, object]) -> dict[str, object]:
     return artifacts
 
 
-def _build_wrapper_objects(summary: dict[str, object]) -> dict[str, object]:
-    return {
+def _build_wrapper_objects(summary: WrapperSummary) -> WrapperObjectsPayload:
+    preprocessor = summary["preprocessor"]
+    objects: WrapperObjectsPayload = {
         "sourceSchema": summary["sourceSchema"],
         "wrapperSchema": summary["wrapperSchema"],
         "helperSchema": summary["helperSchema"],
-        "preprocessorSchema": summary["preprocessor"]["schema"],
-        "preprocessorScript": summary["preprocessor"]["script"],
+        "preprocessorSchema": preprocessor["schema"],
+        "preprocessorScript": preprocessor["script"],
+        "preprocessorLibraryScript": preprocessor.get("libraryScript"),
     }
+    if "publicViews" in summary:
+        objects["publicViews"] = summary["publicViews"]
+    return objects
 
 
-def _build_wrapper_next_actions(summary: dict[str, object]) -> dict[str, object]:
-    next_actions: dict[str, object] = {
-        "activationSql": summary["preprocessor"]["activationSql"],
-        "activationRequired": summary["preprocessor"]["activationRequired"],
+def _build_wrapper_next_actions(summary: WrapperSummary) -> WrapperNextActionsPayload:
+    preprocessor = summary["preprocessor"]
+    next_actions: WrapperNextActionsPayload = {
+        "activationSql": preprocessor["activationSql"],
+        "activationRequired": preprocessor["activationRequired"],
     }
+    if "publicViews" in summary:
+        next_actions["publicViews"] = summary["publicViews"]
     if "smokeTestSql" in summary:
         next_actions["smokeTestSql"] = summary["smokeTestSql"]
     return next_actions
@@ -210,7 +388,7 @@ def _json_success_payload(
     command: str,
     *,
     warnings: list[str] | None = None,
-    errors: list[dict[str, object]] | None = None,
+    errors: list[JsonErrorEntry] | None = None,
     **payload: object,
 ) -> dict[str, object]:
     envelope: dict[str, object] = {
@@ -230,10 +408,10 @@ def _json_error_payload(
     code: str,
     message: str,
     hint: str | None = None,
-    repro: dict[str, object] | None = None,
+    repro: JsonErrorRepro | None = None,
     likely_fix: str | None = None,
 ) -> dict[str, object]:
-    error: dict[str, object] = {
+    error: JsonErrorEntry = {
         "code": code,
         "message": message,
     }
@@ -276,40 +454,128 @@ def _error_code_for_message(message: str, exc: BaseException | None = None) -> s
     return "UNEXPECTED-ERROR"
 
 
-def _describe_root_fields(root_table: dict[str, object], root: dict[str, object]) -> dict[str, object]:
-    top_level_fields: list[dict[str, object]] = []
+def _logical_field_name_and_kind(visible_name: str) -> tuple[str, str]:
+    if visible_name == "_value":
+        return "value", "scalar"
+    if visible_name.endswith("|object"):
+        return visible_name[: -len("|object")], "object"
+    if visible_name.endswith("|array"):
+        return visible_name[: -len("|array")], "array"
+    return visible_name, "scalar"
+
+
+def _manifest_tables(manifest: dict[str, object]) -> list[dict[str, object]]:
+    return cast(list[dict[str, object]], manifest["tables"])
+
+
+def _manifest_roots(manifest: dict[str, object]) -> list[dict[str, object]]:
+    return cast(list[dict[str, object]], manifest["roots"])
+
+
+def _table_groups(table_spec: dict[str, object]) -> list[dict[str, object]]:
+    return cast(list[dict[str, object]], table_spec.get("groups", []))
+
+
+def _root_relationships(root: dict[str, object]) -> list[dict[str, object]]:
+    return cast(list[dict[str, object]], root.get("relationships", []))
+
+
+def _root_family_tables(root: dict[str, object]) -> list[str]:
+    return [str(table_name) for table_name in cast(list[object], root["familyTables"])]
+
+
+def _description_roots(description: dict[str, object]) -> list[dict[str, object]]:
+    return cast(list[dict[str, object]], description["roots"])
+
+
+def _description_public_views(description: dict[str, object]) -> list[str]:
+    return [str(root["publicView"]) for root in _description_roots(description)]
+
+
+def _relationships_by_parent(
+    root: dict[str, object],
+) -> dict[str, list[dict[str, object]]]:
+    relationships: dict[str, list[dict[str, object]]] = {}
+    for relationship in _root_relationships(root):
+        parent_table = str(relationship["parentTable"])
+        relationships.setdefault(parent_table, []).append(relationship)
+    for parent_table in relationships:
+        relationships[parent_table].sort(
+            key=lambda item: (
+                str(item["segmentName"]),
+                str(item["relationKind"]),
+                str(item["childTable"]),
+            )
+        )
+    return relationships
+
+
+def _relationships_by_parent_and_segment(
+    root: dict[str, object],
+) -> dict[str, dict[str, list[dict[str, object]]]]:
+    relationships: dict[str, dict[str, list[dict[str, object]]]] = {}
+    for relationship in _root_relationships(root):
+        parent_table = str(relationship["parentTable"])
+        segment_name, _ = _logical_field_name_and_kind(str(relationship["segmentName"]))
+        relationships.setdefault(parent_table, {}).setdefault(segment_name, []).append(relationship)
+    for parent_table in relationships:
+        for segment_name in relationships[parent_table]:
+            relationships[parent_table][segment_name].sort(
+                key=lambda item: (str(item["relationKind"]), str(item["childTable"]))
+            )
+    return relationships
+
+
+def _infer_array_element_kind(
+    child_table_name: str,
+    *,
+    table_lookup: dict[str, dict[str, object]],
+    relationships_by_parent: dict[str, list[dict[str, object]]],
+) -> str:
+    child_table = table_lookup[child_table_name]
+    visible_names = [
+        str(group["visibleName"])
+        for group in _table_groups(child_table)
+        if group.get("visibleName") not in {None, "_id"}
+    ]
+    child_relationships = relationships_by_parent.get(child_table_name, [])
+    if visible_names in (["_value"], ["value"]) and not child_relationships:
+        return "scalar"
+    if visible_names in (["_value"], ["value"]):
+        return "variant"
+    return "object"
+
+
+def _describe_table_fields(
+    table_name: str,
+    *,
+    table_lookup: dict[str, dict[str, object]],
+    relationships_by_parent_and_segment: dict[str, dict[str, list[dict[str, object]]]],
+) -> TableFieldSummary:
+    table_spec = table_lookup[table_name]
+    top_level_fields: list[TopLevelFieldEntry] = []
     scalar_fields: list[str] = []
-    object_fields: list[dict[str, object]] = []
-    array_fields: list[dict[str, object]] = []
-    relationships_by_segment = {
-        relation["segmentName"]: relation
-        for relation in root.get("relationships", [])
-        if relation["parentTable"] == root["tableName"]
-    }
-    for group in root_table.get("groups", []):
+    object_fields: list[RelatedFieldEntry] = []
+    array_fields: list[RelatedFieldEntry] = []
+    relationships_by_segment = relationships_by_parent_and_segment.get(table_name, {})
+    for group in _table_groups(table_spec):
         visible_name = group.get("visibleName")
         if visible_name in {None, "_id"}:
             continue
-        field_kind = "scalar"
-        logical_name = str(visible_name)
-        if logical_name.endswith("|object"):
-            field_kind = "object"
-            logical_name = logical_name[: -len("|object")]
-        elif logical_name.endswith("|array"):
-            field_kind = "array"
-            logical_name = logical_name[: -len("|array")]
+        logical_name, field_kind = _logical_field_name_and_kind(str(visible_name))
         top_level_fields.append({"name": logical_name, "kind": field_kind})
         if field_kind == "scalar":
             scalar_fields.append(logical_name)
-    for segment_name, relationship in sorted(relationships_by_segment.items()):
-        entry = {
-            "name": segment_name,
-            "childTable": relationship["childTable"],
-        }
-        if relationship["relationKind"] == "array":
-            array_fields.append(entry)
-        elif relationship["relationKind"] == "object":
-            object_fields.append(entry)
+    for segment_name, segment_relationships in sorted(relationships_by_segment.items()):
+        for relationship in segment_relationships:
+            entry: RelatedFieldEntry = {
+                "name": segment_name,
+                "childTable": str(relationship["childTable"]),
+            }
+            if relationship["relationKind"] == "array":
+                array_fields.append(entry)
+            elif relationship["relationKind"] == "object":
+                object_fields.append(entry)
     return {
         "topLevelFields": top_level_fields,
         "scalarFields": scalar_fields,
@@ -318,17 +584,206 @@ def _describe_root_fields(root_table: dict[str, object], root: dict[str, object]
     }
 
 
+def _describe_field_tree(
+    table_name: str,
+    *,
+    table_lookup: dict[str, dict[str, object]],
+    relationships_by_parent: dict[str, list[dict[str, object]]],
+    relationships_by_parent_and_segment: dict[str, dict[str, list[dict[str, object]]]],
+) -> list[dict[str, object]]:
+    table_spec = table_lookup[table_name]
+    relationships_by_segment = relationships_by_parent_and_segment.get(table_name, {})
+    field_tree: list[dict[str, object]] = []
+    for group in _table_groups(table_spec):
+        visible_name = group.get("visibleName")
+        if visible_name in {None, "_id"}:
+            continue
+        logical_name, field_kind = _logical_field_name_and_kind(str(visible_name))
+        entry: dict[str, object] = {
+            "name": logical_name,
+            "kind": field_kind,
+        }
+        segment_relationships = relationships_by_segment.get(logical_name, [])
+        if field_kind == "object":
+            object_relationship = next(
+                (item for item in segment_relationships if item["relationKind"] == "object"),
+                None,
+            )
+            if object_relationship is not None:
+                child_table_name = str(object_relationship["childTable"])
+                entry["childTable"] = child_table_name
+                entry["fields"] = _describe_field_tree(
+                    child_table_name,
+                    table_lookup=table_lookup,
+                    relationships_by_parent=relationships_by_parent,
+                    relationships_by_parent_and_segment=relationships_by_parent_and_segment,
+                )
+        elif field_kind == "array":
+            array_relationship = next(
+                (item for item in segment_relationships if item["relationKind"] == "array"),
+                None,
+            )
+            if array_relationship is not None:
+                child_table_name = str(array_relationship["childTable"])
+                element_kind = _infer_array_element_kind(
+                    child_table_name,
+                    table_lookup=table_lookup,
+                    relationships_by_parent=relationships_by_parent,
+                )
+                entry["childTable"] = child_table_name
+                entry["elementKind"] = element_kind
+                if element_kind == "object":
+                    entry["fields"] = _describe_field_tree(
+                        child_table_name,
+                        table_lookup=table_lookup,
+                        relationships_by_parent=relationships_by_parent,
+                        relationships_by_parent_and_segment=relationships_by_parent_and_segment,
+                    )
+        elif segment_relationships:
+            branch_kinds = sorted({str(item["relationKind"]) for item in segment_relationships})
+            entry["branchKinds"] = branch_kinds
+            object_relationship = next(
+                (item for item in segment_relationships if item["relationKind"] == "object"),
+                None,
+            )
+            if object_relationship is not None:
+                child_table_name = str(object_relationship["childTable"])
+                entry["objectBranch"] = {
+                    "childTable": child_table_name,
+                    "fields": _describe_field_tree(
+                        child_table_name,
+                        table_lookup=table_lookup,
+                        relationships_by_parent=relationships_by_parent,
+                        relationships_by_parent_and_segment=relationships_by_parent_and_segment,
+                    ),
+                }
+            array_relationship = next(
+                (item for item in segment_relationships if item["relationKind"] == "array"),
+                None,
+            )
+            if array_relationship is not None:
+                child_table_name = str(array_relationship["childTable"])
+                element_kind = _infer_array_element_kind(
+                    child_table_name,
+                    table_lookup=table_lookup,
+                    relationships_by_parent=relationships_by_parent,
+                )
+                array_branch: dict[str, object] = {
+                    "childTable": child_table_name,
+                    "elementKind": element_kind,
+                }
+                if element_kind == "object":
+                    array_branch["fields"] = _describe_field_tree(
+                        child_table_name,
+                        table_lookup=table_lookup,
+                        relationships_by_parent=relationships_by_parent,
+                        relationships_by_parent_and_segment=relationships_by_parent_and_segment,
+                    )
+                entry["arrayBranch"] = array_branch
+        field_tree.append(entry)
+    return field_tree
+
+
+def _describe_family_tables(
+    root: dict[str, object],
+    *,
+    table_lookup: dict[str, dict[str, object]],
+    relationships_by_parent: dict[str, list[dict[str, object]]],
+    relationships_by_parent_and_segment: dict[str, dict[str, list[dict[str, object]]]],
+) -> list[dict[str, object]]:
+    root_table_name = str(root["tableName"])
+    relationship_by_child: dict[str, dict[str, object]] = {}
+    path_by_table: dict[str, str | None] = {root_table_name: None}
+    queue: list[str] = [root_table_name]
+    while queue:
+        parent_table_name = queue.pop(0)
+        parent_path = path_by_table[parent_table_name]
+        for child_relationship in relationships_by_parent.get(parent_table_name, []):
+            child_table_name = str(child_relationship["childTable"])
+            if child_table_name in path_by_table:
+                continue
+            segment_name, _ = _logical_field_name_and_kind(str(child_relationship["segmentName"]))
+            path_segment = f"{segment_name}[]" if child_relationship["relationKind"] == "array" else segment_name
+            path_by_table[child_table_name] = path_segment if parent_path is None else f"{parent_path}.{path_segment}"
+            relationship_by_child[child_table_name] = child_relationship
+            queue.append(child_table_name)
+
+    family_tables: list[dict[str, object]] = []
+    for table_name in sorted(_root_family_tables(root), key=lambda item: (path_by_table.get(item) or "", item)):
+        normalized_table_name = str(table_name)
+        summary = _describe_table_fields(
+            normalized_table_name,
+            table_lookup=table_lookup,
+            relationships_by_parent_and_segment=relationships_by_parent_and_segment,
+        )
+        entry: dict[str, object] = {
+            "tableName": normalized_table_name,
+            "pathFromRoot": path_by_table.get(normalized_table_name),
+            "fieldTree": _describe_field_tree(
+                normalized_table_name,
+                table_lookup=table_lookup,
+                relationships_by_parent=relationships_by_parent,
+                relationships_by_parent_and_segment=relationships_by_parent_and_segment,
+            ),
+            **summary,
+        }
+        table_relationship = relationship_by_child.get(normalized_table_name)
+        if table_relationship is None:
+            entry["tableKind"] = "root"
+        else:
+            entry["tableKind"] = str(table_relationship["relationKind"])
+            entry["parentTable"] = str(table_relationship["parentTable"])
+            entry["segmentName"], _ = _logical_field_name_and_kind(str(table_relationship["segmentName"]))
+            if table_relationship["relationKind"] == "array":
+                entry["elementKind"] = _infer_array_element_kind(
+                    normalized_table_name,
+                    table_lookup=table_lookup,
+                    relationships_by_parent=relationships_by_parent,
+                )
+        family_tables.append(entry)
+    return family_tables
+
+
+def _describe_root_fields(
+    root_table: dict[str, object],
+    root: dict[str, object],
+    *,
+    table_lookup: dict[str, dict[str, object]],
+) -> TableFieldSummary:
+    relationships_by_parent = _relationships_by_parent(root)
+    relationships_by_parent_and_segment = _relationships_by_parent_and_segment(root)
+    table_name = str(root["tableName"])
+    field_summary = _describe_table_fields(
+        table_name,
+        table_lookup=table_lookup,
+        relationships_by_parent_and_segment=relationships_by_parent_and_segment,
+    )
+    field_summary["fieldTree"] = _describe_field_tree(
+        table_name,
+        table_lookup=table_lookup,
+        relationships_by_parent=relationships_by_parent,
+        relationships_by_parent_and_segment=relationships_by_parent_and_segment,
+    )
+    field_summary["familyTables"] = _describe_family_tables(
+        root,
+        table_lookup=table_lookup,
+        relationships_by_parent=relationships_by_parent,
+        relationships_by_parent_and_segment=relationships_by_parent_and_segment,
+    )
+    return field_summary
+
+
 def _describe_wrapper_manifest(
     manifest: dict[str, object],
     *,
-    preprocessor: dict[str, object] | None = None,
+    preprocessor: WrapperPreprocessorSummary | None = None,
 ) -> dict[str, object]:
-    table_lookup = {table["tableName"]: table for table in manifest["tables"]}
+    table_lookup = {str(table["tableName"]): table for table in _manifest_tables(manifest)}
     roots: list[dict[str, object]] = []
-    for root in sorted(manifest["roots"], key=lambda item: item["publicView"]):
-        root_table = table_lookup[root["tableName"]]
-        root_fields = _describe_root_fields(root_table, root)
-        example_queries: dict[str, object] = {
+    for root in sorted(_manifest_roots(manifest), key=lambda item: str(item["publicView"])):
+        root_table = table_lookup[str(root["tableName"])]
+        root_fields = _describe_root_fields(root_table, root, table_lookup=table_lookup)
+        example_queries: dict[str, str] = {
             "toJsonAll": (
                 f'SELECT TO_JSON(*) AS doc_json FROM "{manifest["publicSchema"]}"."{root["publicView"]}" '
                 'ORDER BY "_id";'
@@ -340,11 +795,14 @@ def _describe_wrapper_manifest(
                 f'SELECT JSON_AS_VARCHAR(s.{quote_identifier(scalar_name)}) AS sample_value '
                 f'FROM "{manifest["publicSchema"]}"."{root["publicView"]}" s ORDER BY "_id" LIMIT 5;'
             )
-        if root_fields["arrayFields"]:
-            array_name = root_fields["arrayFields"][0]["name"]
+        rowset_example_name = next(
+            (field["name"] for field in root_fields["topLevelFields"] if field["kind"] == "array"),
+            root_fields["arrayFields"][0]["name"] if root_fields["arrayFields"] else None,
+        )
+        if rowset_example_name is not None:
             example_queries["rowset"] = (
                 f'SELECT s."_id", item._index FROM "{manifest["publicSchema"]}"."{root["publicView"]}" s '
-                f'JOIN item IN s.{quote_identifier(array_name)} ORDER BY 1, 2;'
+                f'JOIN item IN s.{quote_identifier(rowset_example_name)} ORDER BY 1, 2;'
             )
         roots.append(
             {
@@ -371,7 +829,7 @@ def _wrapper_discovery_metadata(
     autodiscovered_helper_schema: bool,
     autodiscovered_wrapper_schema: bool,
     manifest: dict[str, object],
-) -> dict[str, object]:
+) -> WrapperDiscoveryMetadata:
     return {
         "surfaceKind": "wrapperPackage",
         "discoveryMethod": "helperSchemaMetadata",
@@ -379,8 +837,8 @@ def _wrapper_discovery_metadata(
         "autodiscoveredWrapperSchema": autodiscovered_wrapper_schema,
         "discoveryScope": "wrapperPackagesOnly",
         "publishedConsumerSurfacesIncluded": False,
-        "wrapperSchema": manifest["publicSchema"],
-        "helperSchema": manifest["helperSchema"],
+        "wrapperSchema": str(manifest["publicSchema"]),
+        "helperSchema": str(manifest["helperSchema"]),
     }
 
 
@@ -389,7 +847,7 @@ def _resolve_installed_wrapper_manifest(
     *,
     wrapper_schema: str | None,
     helper_schema: str | None,
-) -> tuple[dict[str, object], dict[str, object]]:
+) -> tuple[dict[str, object], WrapperDiscoveryMetadata]:
     normalized_wrapper = (
         None if wrapper_schema is None else validate_identifier("Wrapper schema", wrapper_schema)
     )
@@ -470,9 +928,9 @@ def _installed_wrapper_entry(
     con,
     manifest: dict[str, object],
     *,
-    preprocessor: dict[str, object] | None = None,
-    discovery: dict[str, object] | None = None,
-) -> dict[str, object]:
+    preprocessor: WrapperPreprocessorSummary | None = None,
+    discovery: WrapperDiscoveryMetadata | None = None,
+) -> InstalledWrapperEntry:
     return {
         "surfaceKind": "wrapperPackage",
         "discovery": discovery or _wrapper_discovery_metadata(
@@ -612,7 +1070,7 @@ def _normalize_slug(raw: str, *, fallback: str = "data", limit: int = 60) -> str
     return slug[:limit]
 
 
-def _derived_workflow_names(raw_name: str, schema_prefix: str) -> dict[str, str]:
+def _derived_workflow_names(raw_name: str, schema_prefix: str) -> DerivedWorkflowNames:
     prefix = validate_identifier("Schema prefix", schema_prefix)
     token = _normalize_identifier_token(raw_name)
     slug = _normalize_slug(raw_name)
@@ -628,7 +1086,7 @@ def _derived_workflow_names(raw_name: str, schema_prefix: str) -> dict[str, str]
     }
 
 
-def _parse_exasol_url(url: str) -> dict[str, object]:
+def _parse_exasol_url(url: str) -> ParsedExasolUrl:
     parsed = urlparse(url)
     if parsed.scheme.lower() != "exasol":
         raise SystemExit(f"--exasol must use the exasol:// scheme, got: {url}")
@@ -670,7 +1128,7 @@ def _build_exasol_url(
     return urlunparse(("exasol", netloc, f"/{schema}", "", urlencode(query), ""))
 
 
-def _resolve_ingest_connection(args: argparse.Namespace, source_schema: str) -> dict[str, str]:
+def _resolve_ingest_connection(args: argparse.Namespace, source_schema: str) -> IngestConnection:
     if args.exasol:
         parsed = _parse_exasol_url(args.exasol)
         resolved_schema = validate_identifier(
@@ -1113,7 +1571,7 @@ def command_ingest(args: argparse.Namespace) -> None:
         _emit_json_summary(summary)
 
 
-def _derive_phase5_workflow_config(args: argparse.Namespace) -> dict[str, object]:
+def _derive_phase5_workflow_config(args: argparse.Namespace) -> Phase5WorkflowConfig:
     workflow_name = args.name or args.input.stem
     defaults = _derived_workflow_names(workflow_name, args.schema_prefix)
     run_artifact_dir = (_resolved(args.run_artifact_dir) or (args.artifact_dir.resolve() / defaults["artifactSubdir"])).resolve()
@@ -1140,7 +1598,7 @@ def _derive_phase5_workflow_config(args: argparse.Namespace) -> dict[str, object
     }
 
 
-def command_wrap_deploy(args: argparse.Namespace) -> dict[str, object]:
+def command_wrap_deploy(args: argparse.Namespace) -> DeployReport:
     validation_report: dict[str, object] | None = None
     with _stdout_to_stderr(bool(getattr(args, "json", False))):
         wrapper_package_tool.command_install(args)
@@ -1251,6 +1709,7 @@ def command_ingest_and_wrap(args: argparse.Namespace) -> None:
         )
         _emit_json_summary(summary)
     else:
+        wrapper_summary = _build_wrapper_summary_from_config_path(package_config_path)
         print("Unified CLI completed ingest-and-wrap workflow.")
         print(f"Workflow name: {workflow['workflowName']}")
         print(f"Run artifact directory: {run_artifact_dir}")
@@ -1260,6 +1719,8 @@ def command_ingest_and_wrap(args: argparse.Namespace) -> None:
             f"{workflow['sourceSchema']} -> {workflow['wrapperSchema']} / {workflow['helperSchema']} "
             f"with {workflow['preprocessorSchema']}.{workflow['preprocessorScript']}"
         )
+        if "publicViews" in wrapper_summary:
+            print(f'Public views: {", ".join(wrapper_summary["publicViews"])}')
 
 
 def _resolve_wrap_generation_args(args: argparse.Namespace) -> argparse.Namespace:
@@ -1459,7 +1920,7 @@ def command_describe(args: argparse.Namespace) -> None:
             print(f"Package config: {config_path}")
             print(f'Wrapper schema: {description["wrapperSchema"]}')
             print(f'Helper schema: {description["helperSchema"]}')
-            print(f'Roots: {", ".join(root["publicView"] for root in description["roots"])}')
+            print(f'Roots: {", ".join(_description_public_views(description))}')
     elif args.describe_command == "wrapper":
         con = connect_for_generation(
             args.dsn,
@@ -1476,7 +1937,7 @@ def command_describe(args: argparse.Namespace) -> None:
             wrapper_entry = _installed_wrapper_entry(con, manifest, preprocessor=None, discovery=discovery)
         finally:
             con.close()
-        preprocessor = None
+        preprocessor: WrapperPreprocessorSummary | None = None
         warnings: list[str] = []
         if args.preprocessor_schema and args.preprocessor_script:
             preprocessor = {
@@ -1494,6 +1955,7 @@ def command_describe(args: argparse.Namespace) -> None:
             )
         wrapper_entry["description"] = _describe_wrapper_manifest(manifest, preprocessor=preprocessor)
         if args.json:
+            public_views = _description_public_views(wrapper_entry["description"])
             _emit_json_summary(
                 _json_success_payload(
                     "describe wrapper",
@@ -1502,17 +1964,23 @@ def command_describe(args: argparse.Namespace) -> None:
                         "wrapperSchema": manifest["publicSchema"],
                         "helperSchema": manifest["helperSchema"],
                         "sourceSchema": manifest["sourceSchema"],
+                        "publicViews": public_views,
                     },
                     discovery=wrapper_entry["discovery"],
                     description=wrapper_entry["description"],
                     installedState=wrapper_entry["installedState"],
+                    nextActions={
+                        "activationRequired": preprocessor is not None,
+                        "activationSql": None if preprocessor is None else preprocessor["activationSql"],
+                        "publicViews": public_views,
+                    },
                 )
             )
         else:
             description = wrapper_entry["description"]
             print(f'Wrapper schema: {description["wrapperSchema"]}')
             print(f'Helper schema: {description["helperSchema"]}')
-            print(f'Roots: {", ".join(root["publicView"] for root in description["roots"])}')
+            print(f'Roots: {", ".join(_description_public_views(description))}')
     elif args.describe_command == "wrappers":
         con = connect_for_generation(
             args.dsn,
@@ -1550,7 +2018,16 @@ def command_describe(args: argparse.Namespace) -> None:
                         "discoveryScope": "wrapperPackagesOnly",
                         "publishedConsumerSurfacesIncluded": False,
                     },
-                    wrappers=wrappers,
+                    wrappers=[
+                        {
+                            **wrapper,
+                            "wrapperSchema": wrapper["description"]["wrapperSchema"],
+                            "helperSchema": wrapper["description"]["helperSchema"],
+                            "sourceSchema": wrapper["description"]["sourceSchema"],
+                            "publicViews": _description_public_views(wrapper["description"]),
+                        }
+                        for wrapper in wrappers
+                    ],
                 )
             )
         else:

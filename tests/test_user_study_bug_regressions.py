@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import _bootstrap  # noqa: F401
-from pyexasol.statement import ExaStatement
 
 from nano_support import connect, install_source_fixture, install_wrapper_preprocessor, install_wrapper_views
 
@@ -64,8 +63,7 @@ def main() -> None:
                 schema_name=PREPROCESSOR_SCHEMA,
                 script_name=PREPROCESSOR_SCRIPT,
             )
-            prepared_stmt = ExaStatement(
-                prepared_selector_con,
+            prepared_stmt = prepared_selector_con.create_prepared_statement(
                 """
                 SELECT
                   CAST("id" AS VARCHAR(10)) AS doc_id,
@@ -73,7 +71,6 @@ def main() -> None:
                 FROM JSON_VIEW.SAMPLE
                 ORDER BY "id"
                 """,
-                prepare=True,
             )
             prepared_stmt.execute_prepared([(1,)])
             prepared_selector_rows = prepared_stmt.fetchall()
@@ -103,7 +100,7 @@ def main() -> None:
             "BUG-003 duplicate path output names",
         )
 
-        iterator_array_error = fetch_error(
+        iterator_array_rows = fetch_all(
             con,
             """
             SELECT s."id", item."nested.items[LAST]" AS last_nested_item
@@ -112,10 +109,10 @@ def main() -> None:
             ORDER BY s."id", item._index
             """,
         )
-        assert_contains(
-            iterator_array_error,
-            "Bracket access on object-array elements requires a trailing property",
-            "BUG-004 iterator object-array bracket error",
+        assert_equal(
+            iterator_array_rows,
+            [(1, "na-2"), (1, "nb-1"), (2, None)],
+            "BUG-004 iterator object-array bracket path",
         )
 
         aggregate_rows = fetch_all(
@@ -142,6 +139,21 @@ def main() -> None:
             selector_type_error,
             'Array selector "child" resolves to a nested object/array reference',
             "BUG-010 selector type error",
+        )
+
+        method_iterator_alias_error = fetch_error(
+            con,
+            """
+            SELECT CAST(s."id" AS VARCHAR(10)), method
+            FROM JSON_VIEW.SAMPLE s
+            JOIN VALUE method IN s."tags"
+            ORDER BY 1, 2
+            """,
+        )
+        assert_contains(
+            method_iterator_alias_error,
+            "METHOD_",
+            "BUG-012 method iterator alias rewrite",
         )
     finally:
         try:
